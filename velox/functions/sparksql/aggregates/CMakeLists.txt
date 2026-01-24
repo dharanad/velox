@@ -26,6 +26,7 @@ velox_add_library(
   ModeAggregate.cpp
   Register.cpp
   RegrReplacementAggregate.cpp
+  SkewnessAggregate.cpp
   SumAggregate.cpp
   VarianceAggregate.cpp
 )

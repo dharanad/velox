@@ -23,6 +23,7 @@
 #include "velox/functions/sparksql/aggregates/CollectListAggregate.h"
 #include "velox/functions/sparksql/aggregates/CovarianceAggregate.h"
 #include "velox/functions/sparksql/aggregates/RegrReplacementAggregate.h"
+#include "velox/functions/sparksql/aggregates/SkewnessAggregate.h"
 #include "velox/functions/sparksql/aggregates/SumAggregate.h"
 #include "velox/functions/sparksql/aggregates/VarianceAggregate.h"
 
@@ -68,6 +69,7 @@ void registerAggregateFunctions(
   registerModeAggregate(prefix, withCompanionFunctions, overwrite);
   registerVarianceAggregate(prefix, withCompanionFunctions, overwrite);
   registerCovarianceAggregates(prefix, withCompanionFunctions, overwrite);
+  registerSkewnessAggregate(prefix, withCompanionFunctions, overwrite);
 }
 
 } // namespace facebook::velox::functions::aggregate::sparksql

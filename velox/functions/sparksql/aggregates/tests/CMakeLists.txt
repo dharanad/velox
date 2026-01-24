@@ -28,6 +28,7 @@ add_executable(
   MinMaxByAggregationTest.cpp
   ModeAggregateTest.cpp
   RegrReplacementAggregationTest.cpp
+  SkewnessAggregateTest.cpp
   SumAggregationTest.cpp
   VarianceAggregationTest.cpp
 )
