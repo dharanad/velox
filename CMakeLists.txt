@@ -358,6 +358,17 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 endif()
 
 if(UNIX AND NOT APPLE)
+  # Use lld instead of the default ld linker. lld is significantly faster,
+  # especially for large C++ projects like Velox.
+  find_program(LLD_PATH lld)
+  if(NOT LLD_PATH)
+    message(
+            FATAL_ERROR
+            "lld linker not found. Install it (e.g. 'sudo apt install lld') and retry."
+    )
+  endif()
+  message(STATUS "Using lld linker: ${LLD_PATH}")
+  add_link_options(-fuse-ld=lld)
   # linker flags, -export-dynamic for rtti
   add_link_options("-Wl,-export-dynamic")
 endif()
@@ -638,6 +649,19 @@ velox_resolve_dependency(FastFloat)
 
 velox_set_source(folly)
 velox_resolve_dependency(folly)
+
+# The installed Folly cmake config hardcodes gflags_static in
+# Folly::folly_deps INTERFACE_LINK_LIBRARIES. That static archive was not
+# built with -fPIC and cannot be linked into shared libraries. Replace it with
+# gflags_shared, which maps to libgflags.so and has no PIC requirement.
+if(TARGET Folly::folly_deps)
+  get_target_property(_folly_link_libs Folly::folly_deps INTERFACE_LINK_LIBRARIES)
+  if(_folly_link_libs)
+    string(REPLACE "gflags_static" "gflags_shared" _folly_link_libs "${_folly_link_libs}")
+    set_target_properties(Folly::folly_deps PROPERTIES INTERFACE_LINK_LIBRARIES "${_folly_link_libs}")
+  endif()
+  unset(_folly_link_libs)
+endif()
 
 if(${VELOX_BUILD_TESTING})
   # Spark query runner depends on absl, gRPC.
