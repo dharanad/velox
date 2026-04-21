@@ -119,6 +119,64 @@ StripeStreams (compressed raw bytes)
                           VectorPtr& result  (returned to caller)
 ```
 
+### Worked Example: `ColumnReader` Reading an INTEGER Column
+
+**Setup:** A DWRF stripe has an INTEGER column with 5 rows. The PRESENT stream
+marks rows 1 and 3 as null (0-indexed). The DATA stream encodes the three
+non-null values `[10, 30, 50]` in sequence.
+
+```
+PRESENT stream bytes (ByteRLE): 0b_0010_1011  → bits: 1,1,0,1,0  (0=null, 1=non-null)
+  row 0 → non-null
+  row 1 → null
+  row 2 → non-null
+  row 3 → null
+  row 4 → non-null
+
+DATA stream (RLEv1 direct): [10, 30, 50]   (only 3 values; nulls have no slot)
+```
+
+**`next(numValues=5, result, incomingNulls=nullptr)` trace:**
+
+```
+Step 1: resetIfWrongFlatVectorType<int32_t>(result)
+        → result is null; flatVector = nullptr
+
+Step 2: readNulls(5, result=null, incomingNulls=nullptr)
+        notNullDecoder_->next(nullsBuf, 5, nullptr)
+        → nullsBuf bits: [1, 0, 1, 0, 1]  (Velox: 1=valid, 0=null)
+        nullCount = bits::countNulls(...) = 2
+        returns BufferPtr nulls pointing to [1,0,1,0,1]
+
+Step 3: values = AlignedBuffer::allocate<int32_t>(5)
+
+Step 4: result = FlatVector<int32_t>(pool, INTEGER, nulls, nullCount=2, 5, values)
+
+Step 5: ints->nextInts(values->asMutable<int32_t>(), 5, nullsPtr)
+        Decoder reads DATA stream and writes:
+          values[0] = 10   (row 0, non-null)
+          values[1] = 0    (row 1, null — decoder writes 0 as placeholder)
+          values[2] = 30   (row 2, non-null)
+          values[3] = 0    (row 3, null — placeholder)
+          values[4] = 50   (row 4, non-null)
+```
+
+**Result vector state:**
+
+```
+FlatVector<int32_t>:
+  size    = 5
+  nulls   = [1, 0, 1, 0, 1]   (bit 0 = row 0 valid, bit 1 = row 1 null, ...)
+  values  = [10, 0, 30, 0, 50]
+  nullCount = 2
+
+vector->isNullAt(0) = false,  valueAt(0) = 10
+vector->isNullAt(1) = true
+vector->isNullAt(2) = false,  valueAt(2) = 30
+vector->isNullAt(3) = true
+vector->isNullAt(4) = false,  valueAt(4) = 50
+```
+
 ---
 
 ## `SelectiveColumnReader` — The Selective Path
@@ -342,6 +400,336 @@ StripeStreams (compressed bytes)
                                  ▼
                           VectorPtr* result           (returned to SelectiveStructColumnReader)
 ```
+
+### Worked Examples: `SelectiveColumnReader`
+
+The following examples trace the state of the internal buffers step by step.
+Each example uses a BIGINT column (values decoded as `int64_t`, `valueSize_ = 8`).
+
+---
+
+#### Example 1: Dense rows, filter `value > 25`, no nulls
+
+**Stripe data:** 8 rows, all non-null. Encoded values: `[10, 20, 30, 40, 50, 15, 60, 5]`.
+
+**Call:** `read(offset=0, rows=[0,1,2,3,4,5,6,7], incomingNulls=nullptr)`
+
+```
+prepareRead<int64_t>(offset=0, rows=[0..7], incomingNulls=nullptr):
+  numRows = 7 + 1 = 8
+  seekTo(0)                    → readOffset_ already 0, no-op
+  readNulls(8, nullptr, ...)   → PRESENT stream absent; nullsInReadRange_ = nullptr
+  allNull_      = false
+  valueSize_    = 8
+  numValues_    = 0
+  outputRows_   = []           → pre-reserved (filter exists)
+  ensureValuesCapacity<int64_t>(8)  → values_ has 8×8 = 64 bytes
+
+readCommon<..., kEncodingHasNulls=false>(rows=[0..7]):
+  isDense = true  (rows.back()=7 == rows.size()-1=7)
+  filter  = BigintRange(26, INT64_MAX)     (value > 25)
+  keepValues = true, no valueHook
+  → processFilter<Reader, isDense=true, kEncodingHasNulls=false>(
+        filter, ExtractToReader(this), rows)
+  → readHelper<Reader, BigintRange, isDense=true>(filter, ExtractToReader(this), rows)
+  → readWithVisitor(rows, ColumnVisitor<int64_t, BigintRange, ExtractToReader, true>(...))
+```
+
+**Visitor loop** (decoder calls `visitor.process(value, rowIndex)` for each row):
+
+```
+row 0: value=10  → BigintRange::testInt64(10) = false  → discard
+row 1: value=20  → BigintRange::testInt64(20) = false  → discard
+row 2: value=30  → BigintRange::testInt64(30) = true
+                    addValue(30)        → rawValues_[0] = 30,  numValues_ = 1
+                    addOutputRow(2)     → outputRows_ = [2]
+row 3: value=40  → true
+                    addValue(40)        → rawValues_[1] = 40,  numValues_ = 2
+                    addOutputRow(3)     → outputRows_ = [2, 3]
+row 4: value=50  → true
+                    addValue(50)        → rawValues_[2] = 50,  numValues_ = 3
+                    addOutputRow(4)     → outputRows_ = [2, 3, 4]
+row 5: value=15  → false → discard
+row 6: value=60  → true
+                    addValue(60)        → rawValues_[3] = 60,  numValues_ = 4
+                    addOutputRow(6)     → outputRows_ = [2, 3, 4, 6]
+row 7: value=5   → false → discard
+```
+
+**State after `read()`:**
+
+```
+numValues_    = 4
+outputRows_   = [2, 3, 4, 6]
+values_       = [30, 40, 50, 60, ?, ?, ?, ?]   (first 4 slots used)
+resultNulls_  = all-non-null (anyNulls_=false, no null bitmap needed)
+anyNulls_     = false
+```
+
+**`getValues(rows=[2,3,4,6], result)`:**
+
+```
+getIntValues(rows, BIGINT, result)
+  → getFlatValues<int64_t, int64_t>(rows, result, BIGINT)
+
+  allNull_ = false
+  valueSize_ = 8 == sizeof(int64_t) → compactScalarValues<int64_t,int64_t>(rows=[2,3,4,6])
+    sourceRows = outputRows_ = [2,3,4,6]
+    rows       = [2,3,4,6]
+    rows.size() == numValues_ == 4  → no compaction needed
+    values_->setSize(4 * 8 = 32)
+
+  *result = FlatVector<int64_t>(pool, BIGINT, nulls=nullptr, 4, values_=[30,40,50,60])
+```
+
+**Final vector:**
+
+```
+FlatVector<int64_t>:  size=4, no nulls
+  [0]=30, [1]=40, [2]=50, [3]=60
+```
+
+---
+
+#### Example 2: Dense rows, filter `value > 25`, with nulls
+
+**Stripe data:** 8 rows. PRESENT stream marks rows 1 and 3 as null.
+DATA stream has 6 non-null values: `[10, 30, 40, 15, 60, 5]`
+(rows 0, 2, 4, 5, 6, 7 in order).
+
+**Call:** `read(offset=0, rows=[0,1,2,3,4,5,6,7], incomingNulls=nullptr)`
+
+```
+prepareRead<int64_t>:
+  readNulls(8, nullptr, nullsInReadRange_):
+    PRESENT stream decoded → nullsInReadRange_ bits = [1,0,1,0,1,1,1,1]
+    (1=valid, 0=null; rows 1 and 3 are null)
+  allNull_  = false  (not all null)
+  nullsInReadRange_ NOT cleared (mixed nulls)
+  prepareNulls(rows, hasNulls=true):
+    isDense=true, useBulkPath()=true, !hasFilter=false → returnReaderNulls_ = false
+    resultNulls_ allocated (8 bits, all set to kNotNull=1)
+    rawResultNulls_ → pointer into resultNulls_
+```
+
+**Visitor loop** (decoder receives `nulls = nullsInReadRange_`):
+
+```
+row 0: nulls bit 0 = 1 (valid) → decode value=10
+        BigintRange::testInt64(10) = false → discard
+row 1: nulls bit 1 = 0 (null)  → addNull<int64_t>()
+        anyNulls_ = true
+        bits::setNull(rawResultNulls_, 0)   → resultNulls_ bit 0 = 0
+        rawValues_[0] = 0                   → numValues_ = 1
+        addOutputRow(1)                     → outputRows_ = [1]
+row 2: valid → decode value=30
+        testInt64(30) = true
+        addValue(30)    → rawValues_[1]=30, numValues_=2
+        addOutputRow(2) → outputRows_=[1, 2]
+row 3: null → addNull<int64_t>()
+        bits::setNull(rawResultNulls_, 2)   → resultNulls_ bit 2 = 0
+        rawValues_[2] = 0                   → numValues_ = 3
+        addOutputRow(3) → outputRows_=[1, 2, 3]
+row 4: valid → value=40 → testInt64(40)=true
+        addValue(40) → rawValues_[3]=40, numValues_=4
+        addOutputRow(4) → outputRows_=[1,2,3,4]
+row 5: valid → value=15 → testInt64(15)=false → discard
+row 6: valid → value=60 → testInt64(60)=true
+        addValue(60) → rawValues_[4]=60, numValues_=5
+        addOutputRow(6) → outputRows_=[1,2,3,4,6]
+row 7: valid → value=5 → false → discard
+```
+
+**State after `read()`:**
+
+```
+numValues_    = 5
+outputRows_   = [1, 2, 3, 4, 6]
+values_       = [0, 30, 0, 40, 60, ?, ?, ?]
+                 ↑       ↑
+              null     null
+resultNulls_  bits = [0, 1, 0, 1, 1, ...]   (bit 0 and 2 cleared by addNull)
+anyNulls_     = true
+```
+
+**`getValues(rows=[1,2,3,4,6], result)`:**
+
+```
+getFlatValues<int64_t, int64_t>(rows=[1,2,3,4,6], ...):
+  rows.size()==5 == numValues_==5 && sizeof(int64_t)==sizeof(int64_t)
+    → no compaction needed (no gaps, sizes match)
+
+  resultNulls() → resultNulls_  (returnReaderNulls_=false, anyNulls_=true)
+  *result = FlatVector<int64_t>(pool, BIGINT, resultNulls_, 5, values_)
+```
+
+**Final vector:**
+
+```
+FlatVector<int64_t>:  size=5, nullCount=2
+  index 0 → null         (original row 1)
+  index 1 → 30           (original row 2)
+  index 2 → null         (original row 3)
+  index 3 → 40           (original row 4)
+  index 4 → 60           (original row 6)
+```
+
+---
+
+#### Example 3: Sparse rows (parent struct has nulls), no column-level nulls
+
+The struct reader determined that only rows `[0, 2, 5, 7]` have non-null struct
+parents. It passes these as `rows` to the child column reader.
+
+**Stripe data:** 8 rows in the column, all non-null. Encoded: `[10,20,30,40,50,15,60,5]`.
+**incomingNulls:** bitmap `[1,0,1,0,0,1,0,1]` (1=struct parent was non-null).
+
+**Call:** `read(offset=0, rows=[0,2,5,7], incomingNulls=[1,0,1,0,0,1,0,1])`
+
+```
+prepareRead<int64_t>(offset=0, rows=[0,2,5,7], incomingNulls):
+  numRows = 7 + 1 = 8    (span to cover row 7)
+  readNulls(8, incomingNulls, nullsInReadRange_):
+    PRESENT stream absent → column has no own nulls
+    → nullsInReadRange_ = incomingNulls copied:
+      bits = [1,0,1,0,0,1,0,1]
+  allNull_ = false
+```
+
+**Visitor loop** — `rows=[0,2,5,7]` is sparse (isDense=false).
+The visitor checks whether the current row index is in the requested set.
+
+```
+row 0: in rows? yes. nullsInReadRange_ bit 0 = 1 (valid) → decode value=10
+        filter=AlwaysTrue → addValue(10), addOutputRow(0)
+        numValues_=1, outputRows_=[0]
+row 1: not in rows=[0,2,5,7] → decoder skips (advances stream but visitor discards)
+row 2: in rows. bit 2 = 1 → value=30 → addValue(30), addOutputRow(2)
+        numValues_=2, outputRows_=[0,2]
+row 3: not in rows → skip
+row 4: not in rows → skip
+row 5: in rows. bit 5 = 1 → value=15 → addValue(15), addOutputRow(5)
+        numValues_=3, outputRows_=[0,2,5]
+row 6: not in rows → skip
+row 7: in rows. bit 7 = 1 → value=5 → addValue(5), addOutputRow(7)
+        numValues_=4, outputRows_=[0,2,5,7]
+```
+
+**`getValues(rows=[0,2,5,7], result)`** → `FlatVector<int64_t>`:
+
+```
+size=4, no nulls
+  [0]=10, [1]=30, [2]=15, [3]=5
+```
+
+---
+
+#### Example 4: Sparse rows with both parent nulls and column nulls
+
+**Same setup** as Example 3 (parent passes `rows=[0,2,5,7]`,
+`incomingNulls=[1,0,1,0,0,1,0,1]`) but now the column itself also has nulls:
+PRESENT stream marks row 2 as null.
+
+```
+prepareRead: readNulls merges PRESENT and incomingNulls:
+  PRESENT bits:    [1,1,0,1,1,1,1,1]   (row 2 is null in column)
+  incomingNulls:   [1,0,1,0,0,1,0,1]   (rows 1,3,4,6 have null struct parent)
+  merged (AND):    [1,0,0,0,0,1,0,1]
+  → nullsInReadRange_ = [1,0,0,0,0,1,0,1]
+```
+
+**Visitor loop** over rows `[0,2,5,7]`:
+
+```
+row 0: in rows. bit 0=1 (valid) → value=10 → addValue(10), addOutputRow(0)
+row 2: in rows. bit 2=0 (null)  → addNull<int64_t>()
+        resultNulls_ bit 1 = 0  (position 1 in output)
+        rawValues_[1] = 0
+        addOutputRow(2)
+row 5: in rows. bit 5=1 (valid) → value=15 → addValue(15), addOutputRow(5)
+row 7: in rows. bit 7=1 (valid) → value=5  → addValue(5),  addOutputRow(7)
+```
+
+**Final vector after `getValues(rows=[0,2,5,7])`:**
+
+```
+FlatVector<int64_t>:  size=4, nullCount=1
+  index 0 → 10           (row 0: struct non-null, column non-null)
+  index 1 → null         (row 2: struct non-null, column null)
+  index 2 → 15           (row 5: struct non-null, column non-null)
+  index 3 → 5            (row 7: struct non-null, column non-null)
+```
+
+---
+
+#### Example 5: All values null — `allNull_` short-circuit
+
+**Stripe data:** 5 rows, PRESENT stream marks all as null.
+
+```
+prepareRead:
+  nullsInReadRange_ = [0,0,0,0,0]
+  allNull_ = bits::isAllSet(..., kNull) = true
+  nullsInReadRange_ retained (all-null)
+
+read() body:
+  if (allNull_) {
+    // decoder is not called at all for data values — nothing to decode
+    // outputRows_ stays empty because nothing passes any filter over null input
+    return;
+  }
+
+getValues(rows, result):
+  if (allNull_):
+    *result = ConstantVector<int64_t>(pool, 5, /*isNull=*/true, BIGINT, 0)
+    return
+```
+
+**Final result:** a `ConstantVector` of size 5 with `isNull=true`. No allocation
+of a flat buffer, no bitmap, no data copy — cheapest possible null representation.
+
+---
+
+#### Example 6: `returnReaderNulls_` optimisation (bulk path, no filter, dense rows)
+
+**Stripe data:** 5 rows, rows 1 and 3 null. Requested all 5 rows with no filter.
+
+```
+prepareRead:
+  nullsInReadRange_ decoded → bits [1,0,1,0,1]
+  allNull_ = false
+  initReturnReaderNulls(rows=[0..4]):
+    useBulkPath()=true (no filter, AVX2 available)
+    hasFilter=false
+    isDense=true
+    anyNulls_=true (nullsInReadRange_ != nullptr)
+    → returnReaderNulls_ = true     ← optimisation enabled
+
+  prepareNulls(rows, hasNulls=true):
+    returnReaderNulls_=true → resultNulls_ NOT allocated (skipped)
+```
+
+**Decoder runs in bulk mode** — fills `values_` for all 5 rows (nulls get 0),
+does not call `addOutputRow` (no filter).
+
+```
+After read():
+  numValues_    = 5
+  values_       = [10, 0, 30, 0, 50]
+  returnReaderNulls_ = true          ← nullsInReadRange_ will be reused as output nulls
+  anyNulls_     = true
+
+getValues(rows=[0..4], result):
+  resultNulls() → nullsInReadRange_  (because returnReaderNulls_=true)
+    → no copy of null bitmap, just returns the pointer
+
+  *result = FlatVector<int64_t>(pool, BIGINT,
+                nullsInReadRange_,   ← shared directly, zero copy
+                5, values_)
+```
+
+**Saving:** no `resultNulls_` allocation, no null-bitmap copy — the PRESENT
+stream buffer is reused directly as the output null bitmap.
 
 ---
 
@@ -758,3 +1146,511 @@ TableScan operator
           assemble RowVector from field FlatVectors
           → result VectorPtr returned to TableScan
 ```
+
+---
+
+## `ColumnVisitors.h` — The Visitor Pattern in Detail
+
+**Defined in:** `velox/dwio/common/ColumnVisitors.h`
+
+The Visitor pattern is the engine that fuses filter evaluation into the decoder
+hot loop. Instead of decoding all values and filtering afterwards, the decoder
+calls back into a `ColumnVisitor` for each decoded value, letting the visitor
+decide whether to keep or drop it. Every branch in the visitor is resolved at
+compile time via template parameters, producing a specialised, branch-free inner
+loop for each (filter type × row layout × extract mode) combination.
+
+### Template Parameters
+
+```cpp
+template <typename T, typename TFilter, typename ExtractValues, bool isDense>
+class ColumnVisitor;
+```
+
+| Parameter | Meaning |
+|-----------|---------|
+| `T` | The decoded value type (`int64_t`, `float`, `StringView`, …) |
+| `TFilter` | The compile-time filter type (e.g. `BigintRange`, `AlwaysTrue`) |
+| `ExtractValues` | What to do with passing values: `DropValues`, `ExtractToReader`, `ExtractToHook` |
+| `isDense` | `true` when `rows = {0,1,2,...,N-1}` — enables cheaper index arithmetic |
+
+Four compile-time flags derived from these parameters:
+
+| Flag | Expression | Meaning |
+|------|-----------|---------|
+| `kHasFilter` | `!is_same_v<TFilter, AlwaysTrue>` | There is a real filter to apply |
+| `kHasHook` | `!is_same_v<HookType, NoHook>` | Values are pushed to a `ValueHook` |
+| `kFilterOnly` | `is_same_v<ExtractValues, DropValues>` | Only counting/filtering; no values stored |
+| `kHasBulkPath` | Template param | Whether the decoder has a SIMD fast path |
+
+### `ExtractValues` Strategies
+
+Three concrete implementations control what happens when a value passes the
+filter:
+
+**`DropValues`** — used when a parent needs the row set but not the values (e.g.
+filter-only scan). `addValue()` and `addNull()` are no-ops. The visitor still
+tracks which rows pass so the parent can reconcile null maps.
+
+**`ExtractToReader`** — the normal case. `addValue(rowIndex, v)` calls
+`reader_->addValue(v)`, which appends `v` to `values_` in `SelectiveColumnReader`.
+`addNull<T>(rowIndex)` calls `reader_->addNull<T>()`, which appends a zero
+and marks a bit in `resultNulls_`.
+
+**`ExtractToHook`** / **`ExtractToGenericHook`** — used for aggregation push-down
+(`LazyVector` hooks). `addValue(rowIndex, v)` calls `hook_.addValueTyped(rowIndex, v)`,
+delivering values directly to the aggregate without materialising a `FlatVector`.
+
+### `ColumnVisitor` — Core Class
+
+**Construction** (`ColumnVisitors.h:165`):
+
+```cpp
+ColumnVisitor(filter, reader, rows, values)
+```
+
+State captured at construction:
+
+| Member | Role |
+|--------|------|
+| `filter_` | The filter object (reference, zero-copy) |
+| `reader_` | Back-pointer to `SelectiveColumnReader` for buffer access |
+| `rows_` / `numRows_` | The sparse or dense row-number array |
+| `rowIndex_` | Current position within `rows_` |
+| `allowNulls_` | Precomputed: `filter.testNull() && values.acceptsNulls()` |
+| `values_` | The `ExtractValues` strategy object |
+
+#### `process(value, atEnd)` — Per-Value Hot Path
+
+Called by the decoder for every non-null decoded value (`ColumnVisitors.h:319`):
+
+```
+applyFilter(filter_, value)
+  true  → filterPassed(value) → addResult(value) + addOutputRow(currentRow())
+  false → filterFailed()
+advance rowIndex_
+return skip count to decoder
+```
+
+`applyFilter` (defined in `Filter.h:2468`) dispatches to the correct `testXxx()`
+method based on `T`:
+
+```cpp
+template <typename TFilter, typename T>
+bool applyFilter(TFilter& filter, T value) {
+  if constexpr (is_same_v<T, int64_t>)   return filter.testInt64(value);
+  if constexpr (is_same_v<T, double>)    return filter.testDouble(value);
+  if constexpr (is_same_v<T, float>)     return filter.testFloat(value);
+  // ... etc.
+}
+```
+
+The return value of `process()` is the number of non-null values to skip in the
+stream before the next call. For dense rows it is always `0`; for sparse rows it
+is `nextRow - currentRow - 1`.
+
+#### `processNull(atEnd)` — Null Handling
+
+Called when the PRESENT bitmap marks the current row as null (`ColumnVisitors.h:275`):
+
+```
+filter_.testNull()
+  true  → filterPassedForNull() → addNull() + addOutputRow(currentRow())
+  false → filterFailed()
+advance rowIndex_
+```
+
+Only `IsNull` and `AlwaysTrue` filters have `testNull() == true`. Everything
+else silently drops nulls.
+
+#### `checkAndSkipNulls(nulls, current, atEnd)` — Bulk Null Skip
+
+When the decoder has a PRESENT bitmap it calls `checkAndSkipNulls` before
+reading a value (`ColumnVisitors.h:196`). The function:
+
+1. Checks bit `current` in `nulls`.
+2. If the bit is set (non-null), returns `0` immediately — fast path.
+3. If the bit is clear (null), scans forward through the bitmap using
+   `count_trailing_zeros` (dense mode) or manual bit counting (sparse mode)
+   to find the next non-null row.
+4. Returns the number of non-null *stream positions* between the current null
+   and the next non-null row so the decoder can skip that many encoded values.
+
+#### `filterFailed()` — Dropping Results
+
+When a value fails the filter (`ColumnVisitors.h:509`):
+
+```cpp
+void ColumnVisitor::filterFailed() {
+  auto preceding = filter_.getPrecedingPositionsToFail();
+  auto succeeding = filter_.getSucceedingPositionsToFail();
+  if (preceding) reader_->dropResults(preceding);  // undo buffered values
+  if (succeeding) rowIndex_ += succeeding;          // skip rows inside complex type
+}
+```
+
+`getPrecedingPositionsToFail()` and `getSucceedingPositionsToFail()` are only
+non-zero for non-deterministic filters applied to nested columns (e.g. `a[1] > 10`).
+For ordinary filters on flat columns both return `0` and the method is free.
+
+#### `processLength(length, atEnd)` — String Pre-Filtering
+
+Called before reading the actual string bytes (`ColumnVisitors.h:296`). If
+`filter_.testLength(length)` returns `false` the string is rejected before any
+bytes are copied from the stream. Only `BytesRange` (single-value equality) and
+`BytesValues` (IN-list) implement `hasTestLength() == true`; range comparisons
+cannot be decided by length alone so they skip this step.
+
+---
+
+### `DictionaryColumnVisitor` — Dictionary-Encoded Columns
+
+**Defined in:** `ColumnVisitors.h:744`
+
+Inherits `ColumnVisitor` and adds dictionary state from `RawScanState`:
+
+| Member | Source | Purpose |
+|--------|--------|---------|
+| `dict()` | `state_.dictionary.values` | Pointer to the decoded dictionary values |
+| `inDict()` | `state_.inDictionary` | Bit vector: which rows use the dictionary |
+| `filterCache()` | `state_.filterCache` | Per-index `FilterResult` byte array |
+
+#### Per-Value `process()` Path
+
+For each index `value` from the stream (`ColumnVisitors.h:773`):
+
+```
+isInDict()
+  false → treat index as literal value → super::process(signedValue, atEnd)
+  true  → look up dict[value]
+          check filterCache[value]:
+            kSuccess → filterPassed(dictValue)
+            kFailure → filterFailed()
+            kUnknown → applyFilter(filter_, dictValue)
+                         passed → filterCache[value] = kSuccess; filterPassed
+                         failed → filterCache[value] = kFailure; filterFailed
+```
+
+The cache (`FilterResult` byte: `kUnknown=0x40`, `kSuccess=0x80`, `kFailure=0`)
+means each distinct dictionary entry is tested against the filter exactly once per
+stripe and the result is reused for all subsequent occurrences of that index.
+
+#### SIMD Bulk Path — `processRun()`
+
+When the decoder delivers a run of indices at once, `processRun()` processes 8
+at a time using SIMD (`ColumnVisitors.h:840`):
+
+```
+1. Load 8 indices from input into an AVX2/NEON register.
+2. Load the `inDict` bits for those 8 row numbers (sparse or dense mask).
+3. Gather 8 filter-cache bytes in one masked gather instruction.
+4. Extract `unknowns` bitmask (entries with kUnknown status).
+5. Extract `passed` bitmask (entries with kSuccess status).
+6. For each `unknown` bit:
+     applyFilter(filter_, dict[index]) → update cache, update `passed`.
+7. For entries not in dictionary: apply filter directly, update `passed`.
+8. If `passed == 0`: no work, next batch.
+9. If all passed: store 8 row numbers and 8 dict-translated values contiguously.
+10. If partial: use SIMD permute (simd::filter) to compress passing entries
+    to the left; store compressed row numbers and values.
+```
+
+This avoids per-value branches in the common case and compresses the results in
+a single SIMD instruction.
+
+#### RLE Path — `processRle()`
+
+For RLE-encoded dictionary indices, `processRle()` first materialises the RLE
+run into individual index values using SIMD arithmetic, then delegates to
+`processRun()` (`ColumnVisitors.h:1010`):
+
+```cpp
+// delta-encode the row positions relative to currentRow into index values
+numbers = (rows[rowIndex + i] - currentRow) * delta + value;
+// then process the batch via processRun
+```
+
+---
+
+### `StringDictionaryColumnVisitor`
+
+**Defined in:** `ColumnVisitors.h:1203`
+
+A specialisation of `DictionaryColumnVisitor<int32_t, ...>` where the dictionary
+holds `StringView` entries rather than integers. The index stored in `values_`
+at the end is a `StringView` index (not a decoded string) so that the actual
+string bytes remain in the dictionary buffer and are not copied. The visitor
+distinguishes between the stripe-level dictionary (`state_.dictionary`) and the
+per-stride dictionary (`state_.dictionary2`):
+
+```cpp
+StringView valueInDictionary(int64_t index) {
+  if (index < stripeDictSize)
+    return stripe_dict[index];
+  return stride_dict[index - stripeDictSize];
+}
+```
+
+---
+
+### `DirectRleColumnVisitor`
+
+**Defined in:** `ColumnVisitors.h:1442`
+
+Used for direct (non-dictionary) RLE-encoded integer columns. Its `processRun()`
+delegates entirely to `processFixedWidthRun<T, filterOnly, scatter, isDense>()`,
+which is a standalone SIMD template in `DecoderUtil.h` that fuses the filter
+application, result compaction, and output-row bookkeeping into a single loop.
+
+---
+
+### `StringColumnReadWithVisitorHelper`
+
+**Defined in:** `ColumnVisitors.h:1541`
+
+A dispatcher helper used by string and binary column readers. It selects the
+correct `ColumnVisitor` template instantiation based on the runtime `ScanSpec`:
+
+```
+scanSpec->keepValues()
+  yes:
+    has hook → ExtractToGenericHook + AlwaysTrue
+    no hook  → ExtractToReader + switch(filter->kind()):
+                 kIsNull         → filterNulls<T>(rows, true, true)  (no visitor)
+                 kIsNotNull      → filterNulls<T>(rows, false, false) (no visitor)
+                 kBytesRange     → ColumnVisitor<string_view, BytesRange, ...>
+                 kBytesValues    → ColumnVisitor<string_view, BytesValues, ...>
+                 ...
+  no:
+    DropValues + same filter dispatch
+```
+
+For `IsNull` / `IsNotNull` on columns with nulls, it bypasses the visitor
+entirely and calls `filterNulls<T>()` directly because the answer depends only
+on the PRESENT stream, not on any decoded value.
+
+---
+
+## `Filter.h` — The Filter Hierarchy
+
+**Defined in:** `velox/type/Filter.h`
+
+Filters are pure predicates pushed down from the query plan into the column
+reader hot loop. Every filter is stateless once constructed. The hierarchy is
+designed so that compile-time template specialisation on `FilterKind` eliminates
+virtual dispatch inside the per-value hot path.
+
+### `FilterKind` Enum
+
+```
+kAlwaysFalse, kAlwaysTrue,
+kIsNull, kIsNotNull,
+kBoolValue,
+kBigintRange, kBigintValuesUsingHashTable, kBigintValuesUsingBitmask,
+kNegatedBigintRange, kNegatedBigintValuesUsingHashTable, kNegatedBigintValuesUsingBitmask,
+kBigintValuesUsingBloomFilter,
+kDoubleRange, kFloatRange,
+kBytesRange, kNegatedBytesRange, kBytesValues, kNegatedBytesValues,
+kBigintMultiRange, kMultiRange,
+kHugeintRange, kHugeintValuesUsingHashTable,
+kTimestampRange
+```
+
+### `Filter` Base Class
+
+**Defined in:** `Filter.h:68`
+
+Key interface methods:
+
+| Method | Description |
+|--------|-------------|
+| `testNull()` | Returns `nullAllowed_` — whether null passes this filter |
+| `testInt64(v)` | Tests a scalar integer value |
+| `testDouble(v)` / `testFloat(v)` | Tests a floating point value |
+| `testBytes(ptr, len)` / `testStringView(v)` | Tests a string value |
+| `testTimestamp(v)` | Tests a timestamp value |
+| `testBool(v)` | Tests a boolean value |
+| `testValues(batch<T>)` | SIMD batch test — returns `batch_bool<T>` |
+| `testInt64Range(min, max, hasNull)` | Row-group pruning: can any value in [min,max] pass? |
+| `testDoubleRange(...)` / `testBytesRange(...)` | Same for other types |
+| `testLength(len)` | Pre-check for strings: can a string of this length pass? |
+| `hasTestLength()` | Whether `testLength` is worth calling |
+| `getPrecedingPositionsToFail()` | For complex type filters: entries to retroactively fail |
+| `getSucceedingPositionsToFail()` | For complex type filters: entries to skip ahead |
+| `mergeWith(other)` | AND-combine two filters |
+| `clone(nullAllowed)` | Copy with optional null-flag override |
+
+`deterministic` is a `static constexpr bool = true` on the base class. A filter
+sets it to `false` only when applied to a nested column (e.g. `a[1] > 10` where
+the filter is non-deterministic across top-level positions). The `ColumnVisitor`
+checks this at compile time to decide whether to call `applyFilter` or
+`isDeterministic()` at runtime.
+
+### Key Filter Implementations
+
+#### `AlwaysTrue` / `AlwaysFalse`
+
+Sentinel filters. `AlwaysTrue` is the default when no filter is present in the
+`ScanSpec`: all values pass, the visitor becomes a pure copy loop. `AlwaysFalse`
+is rarely pushed down directly; it typically results from merging conflicting
+filters.
+
+#### `IsNull` / `IsNotNull`
+
+Applied to any type. `IsNull::testNull() == true`, `testInt64() == false` (and
+all other value tests are `false`). `IsNotNull` is the complement. The visitor's
+`processNull()` path checks `filter_.testNull()`, so `IsNull` causes nulls to
+pass and non-nulls to be dropped. For columns where the encoding has no nulls,
+`StringColumnReadWithVisitorHelper` short-circuits to `filterNulls<T>()` rather
+than running the full visitor loop.
+
+#### `BigintRange` (`Filter.h:734`)
+
+A closed interval `[lower, upper]` for 64-bit integers. The constructor
+precomputes clamped `int32` and `int16` bounds so SIMD comparisons can use
+narrower registers for `int32` and `int16` columns without widening:
+
+```cpp
+testInt64(v)  → v >= lower_ && v <= upper_
+testValues(batch<int64_t>) → SIMD broadcast compare in two directions
+testValues(batch<int32_t>) → uses lower32_ / upper32_, returns all-false if no overlap
+testValues(batch<int16_t>) → uses lower16_ / upper16_
+testInt64Range(min, max, hasNull)  // row-group pruning: !(min > upper || max < lower)
+```
+
+Used for `c > 25` (where 25 is stored as `lower=26, upper=INT64_MAX`) and range
+predicates. `isSingleValue_` triggers an equality comparison instead of a range
+check.
+
+#### `BigintValuesUsingHashTable` (`Filter.h:991`)
+
+IN-list filter for integers. Implemented as a fixed-size open-addressing hash
+table using Murmur-inspired multiplicative hashing. The SIMD `testValues()` path
+does a single masked gather to fetch all candidate buckets at once, produces
+`passed` and `missed` bitmasks, and only falls back to scalar probing for the
+unresolved lanes. Effective when the IN-list is large and values are spread
+across a wide range.
+
+#### `BigintValuesUsingBitmask` (`Filter.h:1226`)
+
+IN-list filter for integers implemented as a dense boolean bitmask
+`bitmask_[value - min_]`. Faster than hash table when `max - min` is small
+(O(1) lookup via direct index). The planner calls `createBigintValues()` which
+picks hash table vs. bitmask based on the range.
+
+#### `BigintValuesUsingBloomFilter` (`Filter.h:1293`)
+
+Probabilistic filter using a split-block Bloom filter. Used for runtime filter
+push-down (build side of a hash join). False-positive rate targets 1%. `testInt64Range()` always returns `true` because the Bloom filter cannot prove
+range absence.
+
+#### `FloatingPointRange<T>` (`Filter.h:1597`)
+
+Range filter for `float` or `double`. Handles open/closed bounds and unbounded
+ends. A separate `testFloatingPoints(batch<T>)` SIMD path handles NaN: NaN
+passes only when `upperUnbounded_` is true (NaN is treated as greater than
+positive infinity). The cross-type specialisation `FloatingPointRange<double>::testValues(batch<float>)` falls back to scalar to handle schema evolution where a
+`double` filter is applied to a `float` column.
+
+#### `BytesRange` (`Filter.h:1882`)
+
+Range filter for strings with optional single-value fast path:
+
+- `singleValue_ == true`: triggered when `lower == upper` (equality). `testStringView()` does a direct `StringView ==` comparison. `testLength()` rejects immediately on wrong length. `testLengths(batch<int32_t>)` is a SIMD equality check on lengths.
+- General range: compares `StringView` lexicographically against `lowerView_` / `upperView_`.
+- Row-group pruning: `testBytesRange(min, max, hasNull)` checks if the column range overlaps the filter range.
+
+#### `BytesValues` (`Filter.h:2244`)
+
+IN-list filter for strings. Uses an `F14FastSet<std::string>` plus a
+`F14FastSet<uint32_t>` of string lengths for a two-level pre-check: first
+`lengths_.contains(len)`, then `values_.contains(string(ptr, len))`. This
+avoids hashing strings whose length cannot possibly match any entry.
+
+#### `BigintMultiRange` / `MultiRange`
+
+OR-combinations. `BigintMultiRange` maintains a sorted list of
+`BigintRange` objects and a precomputed `lowerBounds_` array for binary search.
+`testInt64(v)` does a lower-bound search then a single range check.
+`MultiRange` is the heterogeneous variant used for complex OR predicates on
+strings or floats.
+
+#### `TimestampRange` (`Filter.h:2171`)
+
+Closed `[lower, upper]` range on `Timestamp`. `testTimestampRange()` is used
+by row-group skipping.
+
+---
+
+### Row-Group Pruning via `testXxxRange()`
+
+When `SelectiveColumnReader::filterRowGroups()` is called before entering a
+stride, it extracts the per-stride `min` / `max` / `hasNull` statistics from the
+`RowIndex` protobuf and calls the appropriate `testXxxRange()` method on the
+filter. If it returns `false`, the entire stride is skipped without decoding a
+single value.
+
+```cpp
+// Inside filterRowGroups() for an integer column:
+bool passes = filter->testInt64Range(
+    stats.getMinimum(), stats.getMaximum(), stats.hasNull());
+if (!passes) stridesToSkip.set(stride);
+```
+
+The range test is conservative: it can only reject a stride, never incorrectly
+accept one that would otherwise fail.
+
+---
+
+### Connecting Filters to Visitors: End-to-End Dispatch
+
+The full chain from `ScanSpec` to a decoded value being tested:
+
+```
+ScanSpec::filter()                         // set by query planner; e.g. BigintRange(26, INT64_MAX)
+  ↓
+SelectiveIntegerColumnReader::readCommon() // SelectiveIntegerColumnReader.h
+  → processFilter<isDense>(filter, rows)
+      switch(filter->kind()):
+        kBigintRange →
+          readHelper<BigintRange, isDense>(
+              static_cast<BigintRange*>(filter), rows, ExtractToReader(this))
+              → ColumnVisitor<int64_t, BigintRange, ExtractToReader, isDense>(
+                    *filter, this, rows, extractor)
+              → readWithVisitor(rows, visitor)
+                  decoder->readWithVisitor(nullsInReadRange_, visitor)
+                    per-value loop:
+                      value = decode_next()
+                      skip = visitor.process(value, atEnd)
+                               applyFilter(filter_, value)
+                                 → BigintRange::testInt64(value)
+                                     return value >= lower_ && value <= upper_
+                               passed → ExtractToReader::addValue(rowIndex, v)
+                                          → reader_->addValue(v)  // appended to values_
+                                        addOutputRow(currentRow())
+                               failed → filterFailed()  // no-op for simple filter
+```
+
+For dictionary-encoded columns, `readWithVisitor` calls
+`visitor.toDictionaryColumnVisitor()` and the per-value loop uses the filter-cache
+SIMD path. For direct-encoded columns it uses `DirectRleColumnVisitor::processRun`
+which calls `processFixedWidthRun` with the filter baked into the loop.
+
+The result: for a `BigintRange` filter on a direct integer column, the inner loop
+is essentially:
+
+```cpp
+while (!atEnd) {
+  auto value = rle_decode_one();
+  if (value >= lower_ && value <= upper_) {
+    rawValues_[numValues_] = value;
+    outputRows_[numValues_] = currentRow;
+    ++numValues_;
+  }
+  advance();
+}
+```
+
+with no virtual dispatch, no heap allocation, and no branch on null (unless the
+PRESENT stream has nulls, in which case `checkAndSkipNulls` handles the null
+skip before any value is decoded).
