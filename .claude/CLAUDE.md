@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in the Velox repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## PR Review
 
@@ -14,7 +14,24 @@ When asked a question about the PR or codebase (via `/query`), use the /query sk
 
 Velox is an open source C++ library for composable data processing and
 query execution. Licensed under Apache 2.0. Requires C++20, GCC 11+ or
-Clang 15+.
+Clang 15+. It takes a fully optimized query plan as input and executes it;
+SQL parsing and query optimization happen outside Velox.
+
+## Architecture
+
+Velox's execution stack, from bottom to top:
+
+- **`velox/type`** — Generic type system (scalar, complex, and nested types). Entry point for any new type.
+- **`velox/vector`** — Arrow-compatible columnar memory layout with multiple encodings: Flat, Dictionary, Constant, Sequence/RLE, and Lazy. `BaseVector` is the root abstraction.
+- **`velox/expression`** — Fully vectorized expression evaluation over Vectors. `Expr` / `ExprCompiler` compile a plan expression tree; `EvalCtx` carries evaluation state.
+- **`velox/functions`** — Vectorized scalar, aggregate, and window function implementations. `prestosql/` and `sparksql/` hold dialect-specific functions.
+- **`velox/exec`** — Relational operators (scan, filter, project, hash join, group-by, order-by, exchange). A `Task` drives a pipeline of `Driver`s, each running a chain of `Operator`s.
+- **`velox/connectors`** — Extensible data source/sink interface. `hive/` implements the Hive connector for ORC, DWRF, Parquet, and Nimble via `velox/dwio`.
+- **`velox/core`** — Query plan nodes (`PlanNode`) and execution context (`QueryCtx`).
+- **`velox/common`** — Cross-cutting infrastructure: memory management (`memory/`), caching (`caching/`), file I/O abstraction (`file/`), compression, config, and metrics.
+- **`velox/serializers`** — Wire protocols for distributed shuffle: PrestoPage and Spark UnsafeRow.
+
+Extensibility points: custom types, scalar/aggregate/window functions, operators, file formats, storage adapters, and network serializers.
 
 ## Build
 
@@ -26,9 +43,10 @@ make release  # optimized build
 ## Testing
 
 ```bash
-make unittest                    # run all tests
-cd _build/debug && ctest -j 8   # run all tests in parallel
-ctest -R ExprTest                # run tests matching a pattern
+make unittest                              # run all tests
+cd _build/debug && ctest -j 8             # run all tests in parallel
+ctest -R ExprTest                          # run tests matching a pattern
+./_build/debug/velox/expression/tests/velox_expression_test --gtest_filter=ExprTest.basic  # run a single test
 ```
 
 Test files live in `tests/` subdirectories alongside source.

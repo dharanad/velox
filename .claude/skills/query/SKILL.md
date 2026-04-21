@@ -14,11 +14,12 @@ Answer questions about the Velox project codebase or specific pull requests.
 - Custom memory management with MemoryPool
 - Vectorized execution with custom Vector types
 - Follows Google C++ style with some modifications
+- Velox documentation live in `docs/develop/`. Also contains information for debugging using the tools this project provides
 
 ## Guidelines
 
 - Read CLAUDE.md and CODING_STYLE.md for project-specific conventions
 - Answer thoroughly and accurately
 - If the question is about PR changes, analyze the diff carefully
-- If it's about the codebase, explore relevant files to provide a complete answer
+- If it's about the codebase, explore relevant files & documentation (if present) to provide a complete answer
 - Be specific and reference exact file paths and line numbers when relevant
