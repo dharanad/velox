@@ -717,3 +717,325 @@ For each conversion pair in scope:
 
 Ensure all existing `DwrfReaderTest` cases pass unchanged — the new code must
 not alter behaviour for matching types.
+
+---
+
+## Parquet Reader Extension
+
+### Architecture Differences Between DWRF and Parquet
+
+The `ConvertingSelectiveColumnReader` wrapper is format-agnostic and lives in
+`velox/dwio/common/`. Applying it to Parquet requires understanding where the
+Parquet reader diverges from DWRF.
+
+| Aspect | DWRF | Parquet |
+|--------|------|---------|
+| Type guard at build | `checkTypeCompatibility` throws on mismatch | **No guard** — `ParquetColumnReader::build()` dispatches on `fileType->kind()` without validation |
+| Entry point | `SelectiveDwrfReader::build()` | `ParquetColumnReader::build()` |
+| Null representation | Separate `PRESENT` stream decoded before data | Nulls interleaved with data via definition levels inside `PageReader`. `ParquetData::parentNullsInLeaves()` returns `true`. |
+| `readNulls()` | Decodes `PRESENT` stream into `nullsInReadRange_` | Returns `nullptr` for column-level nulls; nulls come from the page (definition levels decoded inside `readWithVisitor()`) |
+| Integer storage | File-type dependent (INT32 for INTEGER, INT64 for BIGINT) | Always INT32 for TINYINT/SMALLINT/INTEGER, INT64 for BIGINT (`parquetSizeOfIntKind`) |
+| Decimal | Separate reader | `IntegerColumnReader::getValues()` rescales via `rescaleDecimalValues()` |
+| Row group skipping | Stripe-level column stats in DWRF footer | File-level column chunk stats in Parquet footer (`ParquetData::filterRowGroups`) |
+| Encoding variety | DIRECT, DICTIONARY, RLE per stripe | PLAIN, DICTIONARY, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, RLE_DICTIONARY per page — encoding can switch page-to-page |
+| Dictionary switching | Stripe-level dictionary, fixed per stripe | Page-level dictionary; `dedictionarize()` called when a page switches from dictionary to plain mid-column-chunk |
+
+### What Already Works in Parquet (No Wrapper Needed)
+
+Because `ParquetColumnReader::build()` has no type guard and `IntegerColumnReader`
+inherits from `SelectiveIntegerColumnReader` (which dispatches on `requestedType_`),
+several conversions already work:
+
+| Conversion | Mechanism |
+|------------|-----------|
+| TINYINT / SMALLINT / INTEGER → BIGINT | `IntegerColumnReader::getValues()` calls `getIntValues(rows, requestedType_, result)`. The int family always decodes at 64-bit in `values_`; upcasting is free. |
+| REAL → DOUBLE | `FloatingPointColumnReader<float, double>` is selected when `requestedType == DOUBLE` |
+| INTEGER / BIGINT → SHORT\_DECIMAL | `IntegerColumnReader::rescaleDecimalValues()` multiplies by `10^targetScale` post-decode |
+| SHORT\_DECIMAL → SHORT\_DECIMAL (scale widening) | Same `rescaleDecimalValues()` path |
+| LONG\_DECIMAL → LONG\_DECIMAL (scale widening) | Same path with `int128_t` multiplier |
+
+**Narrowing within the int family** (e.g., BIGINT → INTEGER) also passes through
+`getIntValues()` → `getFlatValues<int64_t, int32_t>()` → `compactScalarValues`
+which does an unchecked `static_cast`. This is the same overflow-without-null bug
+as in DWRF and must be fixed in both places — see the narrowing section below.
+
+### What Needs Wrapping in Parquet
+
+| File type | Requested type | Gap |
+|-----------|---------------|-----|
+| INTEGER / BIGINT | REAL / DOUBLE | No path from integer to float reader |
+| REAL / DOUBLE | INTEGER / BIGINT | `FloatingPointColumnReader` does not null out-of-range/NaN values during narrowing |
+| BIGINT (int family) | INTEGER / SMALLINT / TINYINT | `compactScalarValues` truncates silently instead of producing nulls |
+| INTEGER / BIGINT / REAL / DOUBLE | VARCHAR | No numeric-to-string path |
+| VARCHAR | INTEGER / BIGINT / REAL / DOUBLE | `StringColumnReader` ignores `requestedType_` (doesn't even take it) |
+| TIMESTAMP | BIGINT | `TimestampColumnReader` does not expose an integer view |
+| BIGINT | TIMESTAMP | No integer-to-timestamp reader |
+| SHORT\_DECIMAL | LONG\_DECIMAL | No cross-width decimal path |
+| DECIMAL (any) | scale narrowing | Blocked by `VELOX_USER_CHECK_GE` in `rescaleDecimalValues()` |
+
+### Applying the Wrapper to Parquet
+
+The wrapper class `ConvertingSelectiveColumnReader` is unchanged — it is
+format-agnostic and operates through the `SelectiveColumnReader` interface.
+Parquet support is entirely a matter of calling `build()` correctly.
+
+#### Changes to `ParquetColumnReader::build()`
+
+```cpp
+std::unique_ptr<dwio::common::SelectiveColumnReader>
+ParquetColumnReader::build(
+    const ColumnReaderOptions& columnReaderOptions,
+    const TypePtr& requestedType,
+    const std::shared_ptr<const TypeWithId>& fileType,
+    ParquetParams& params,
+    common::ScanSpec& scanSpec) {
+
+  const bool needsConversion =
+      !typeutils::isSafeParquetWidening(*fileType->type(), *requestedType);
+
+  if (needsConversion) {
+    // Build inner reader for the file type with no filter.
+    auto innerScanSpec = scanSpec.cloneWithoutFilter();
+    auto inner = buildForFileType(
+        columnReaderOptions, fileType, params, *innerScanSpec);
+    return std::make_unique<ConvertingSelectiveColumnReader>(
+        requestedType, fileType, std::move(inner),
+        std::move(innerScanSpec), scanSpec);
+  }
+
+  // Existing switch on fileType->type()->kind() — unchanged.
+  switch (fileType->type()->kind()) { ... }
+}
+```
+
+`isSafeParquetWidening` covers the cases listed under "What Already Works" above:
+integer widening within the int family, REAL→DOUBLE, and decimal scale widening.
+Everything else routes through the wrapper.
+
+`buildForFileType` is the existing `switch` block extracted into a helper that
+always passes `fileType->type()` as the `requestedType`, producing a reader in
+the file-type domain.
+
+#### Parquet-Specific: `StringColumnReader` Has No `requestedType`
+
+`StringColumnReader` is constructed without a `requestedType` parameter — it
+always produces VARCHAR/VARBINARY output. For VARCHAR→numeric conversions, the
+wrapper wraps a `StringColumnReader` (which reads the file's byte array data)
+and converts the resulting `StringView` values to the numeric target type.
+No change to `StringColumnReader` is needed.
+
+For numeric→VARCHAR conversions, the inner reader is the appropriate numeric
+reader (e.g., `IntegerColumnReader`) built for the file type. The wrapper reads
+int64 values from the inner reader and formats them as strings.
+
+### Parquet-Specific Null Model and the Wrapper
+
+In DWRF, nulls are a separate `PRESENT` stream. The inner reader decodes them
+into `nullsInReadRange_` during `prepareRead()`, before any data values are read.
+
+In Parquet, nulls are encoded as definition levels inside each data page and are
+decoded atomically with data values during `PageReader::readWithVisitor()`. By
+the time `inner_->read()` completes, the inner reader's `resultNulls_` or
+`nullsInReadRange_` already has the correct null bitmap from the page-level
+definition level decoding.
+
+**Consequence for the wrapper**: `convert()` reads `fileTypeVector_->rawNulls()`
+for the source null bitmap. This is already correct — the inner Parquet reader
+has set it via the definition-level path. No special handling is needed.
+
+For non-leaf struct nodes, `ParquetData::setNulls()` injects pre-computed null
+bitmaps before the child `read()` calls. The `ConvertingSelectiveColumnReader`
+wraps leaf-level column readers, so `presetNulls_` in `ParquetData` is not
+involved at the wrapper level.
+
+#### `parentNullsInLeaves_ = true`
+
+When `parentNullsInLeaves()` returns `true` (Parquet), the struct reader does
+not call `addParentNulls()` on children. Instead, parent-level nulls are already
+baked into the definition levels at the leaf. The wrapper forwards `read()` to
+the inner reader which handles this correctly through its own `ParquetData`.
+
+No special handling is required in `ConvertingSelectiveColumnReader` for this
+difference. The `incomingNulls` parameter passed to `read()` is always `nullptr`
+for Parquet leaf readers; the wrapper passes it through unchanged.
+
+### Dictionary Encoding and `dedictionarize()`
+
+Parquet column chunks can start with a dictionary page and then switch to data
+pages with plain encoding. When this switch happens, `StringColumnReader::dedictionarize()`
+is called to flatten the dictionary into the values buffer so subsequent plain
+values can be appended.
+
+`ConvertingSelectiveColumnReader` must forward `dedictionarize()` to the inner
+reader:
+
+```cpp
+void ConvertingSelectiveColumnReader::dedictionarize() {
+  inner_->dedictionarize();
+}
+```
+
+Without this, the inner string reader would be left in an inconsistent state
+when a dictionary→plain switch occurs mid-scan of a wrapped string column.
+
+For integer readers wrapped for cross-domain conversion (e.g., INT→DOUBLE),
+`IntegerColumnReader::dedictionarize()` is a no-op (the base class default), so
+forwarding is harmless.
+
+### Row Group Skipping in Parquet
+
+Parquet row group skipping uses column chunk statistics stored in the file footer
+(`ParquetData::filterRowGroups()` → `rowGroupMatches()` → compares min/max/bloom
+filter against `scanSpec.filter()`).
+
+The filter in `ScanSpec` is in the **requested-type domain**. For the wrapped
+cases (cross-domain conversions), the column chunk statistics are in the
+**file-type domain**. The same mismatch problem as in DWRF applies.
+
+`ConvertingSelectiveColumnReader::filterRowGroups()` behaviour for Parquet:
+
+```
+if isSafeParquetWidening(fileType, requestedType):
+    // Statistics domain is compatible. Delegate to inner_.
+    inner_->filterRowGroups(rowGroupSize, context, result);
+else:
+    // Cannot reliably skip row groups — statistics are in the wrong domain.
+    // Return without marking anything as skippable.
+    return;
+```
+
+This means the wrapping preserves correctness at the cost of losing row group
+pruning for cross-domain conversions. A future optimisation can convert the
+statistics (min/max of file type) to the requested type and re-evaluate the
+filter against those converted values.
+
+**Bloom filter**: Parquet bloom filters encode hashed file-type values. Comparing
+a requested-type filter against a file-type bloom filter is not valid even for
+widening (hashes are type-specific). Bloom filter-based pruning is disabled for
+all wrapped columns regardless of conversion direction.
+
+### Row Group Statistics Conversion (Future)
+
+For narrowing and cross-domain conversions, a future phase can enable row group
+skipping by converting the file statistics before comparison:
+
+```
+minConverted = convertValue(fileMin, requestedType)  // kNull if unrepresentable
+maxConverted = convertValue(fileMax, requestedType)  // kNull if unrepresentable
+
+if minConverted == kNull && maxConverted == kNull:
+    // All values in group would become null → group can be skipped if filter
+    // excludes nulls.
+else:
+    // Test the converted [min, max] range against the filter.
+```
+
+This logic belongs in a `ConvertingSelectiveColumnReader::filterRowGroupsWithStats()`
+helper, called from `filterRowGroups()` when the inner reader's stats are
+available.
+
+### Decimal Scale Narrowing in Parquet
+
+The existing `rescaleDecimalValues()` blocks scale narrowing with
+`VELOX_USER_CHECK_GE(scaleAdjust, 0, ...)`. Under this design, scale narrowing
+is handled by the wrapper:
+
+1. `ParquetColumnReader::build()` detects that the file decimal scale exceeds the
+   requested decimal scale (narrowing).
+2. An inner reader is built for the file decimal type with `cloneWithoutFilter()`.
+3. The wrapper's `convert()` calls `rescaleDecimal(srcValue, fileScale, dstValue, dstScale, dstPrecision)`.
+4. Values that overflow the target precision are nulled.
+
+The existing `VELOX_USER_CHECK_GE` in `rescaleDecimalValues()` is not reachable
+for wrapped paths because the inner reader is built with the file type as both
+file and requested type — the scale adjustment is zero in that path.
+
+### Physical vs Logical Type Mapping in Parquet
+
+Parquet separates physical encoding (INT32, INT64, FLOAT, DOUBLE, BYTE\_ARRAY,
+FIXED\_LEN\_BYTE\_ARRAY, INT96, BOOLEAN) from logical type annotations (INTEGER,
+DECIMAL, DATE, TIME, TIMESTAMP, STRING, ENUM, UUID, etc.).
+
+The Velox `TypePtr` stored in `ParquetTypeWithId::type()` is already the
+**logical type** (e.g., TIMESTAMP, DECIMAL(18,3), VARCHAR). The `parquetType_`
+field carries the physical type when needed by specific readers.
+
+When building the inner reader for a wrapped conversion, the inner reader's
+`fileType` must remain the original `ParquetTypeWithId` (not a plain Velox
+`TypeWithId`) so that `parquetType_`, `logicalType_`, `maxRepeat_`, and
+`maxDefine_` are preserved. These fields are used by `ParquetData::toFormatData()`
+and `ParquetColumnReader::build()` to select the correct reader and page format.
+
+Concretely: the `buildForFileType()` helper must pass the original
+`shared_ptr<const ParquetTypeWithId>` through unchanged, using `fileType->type()`
+only to construct the `innerScanSpec_` — not to downcast or re-wrap the type node.
+
+### Summary of Changes for Parquet
+
+#### New behaviour
+
+```
+ParquetColumnReader::build(requestedType, fileType, params, scanSpec)
+  │
+  ├─ isSafeParquetWidening(file, requested)?
+  │     YES → existing switch (unchanged)
+  │
+  └─ NO → buildForFileType(file, file, params, innerSpec)
+              → ConvertingSelectiveColumnReader(requested, file, inner, innerSpec, scanSpec)
+```
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `velox/dwio/parquet/reader/ParquetColumnReader.cpp` | Add `needsConversion` check and wrapper creation, similar to DWRF |
+| `velox/dwio/common/TypeUtils.h/.cpp` | Add `isSafeParquetWidening()` (or reuse `isSafeWidening` if the sets are identical) |
+| `velox/dwio/common/ConvertingSelectiveColumnReader.h/.cpp` | Add `dedictionarize()` forwarding |
+
+#### New files
+
+| File | Content |
+|------|---------|
+| `velox/dwio/parquet/reader/tests/ParquetSchemaConversionTest.cpp` | Integration tests for all Parquet conversion pairs |
+
+#### No changes needed
+
+| Component | Reason |
+|-----------|--------|
+| `ParquetData` | Null handling, row group stats, and `readWithVisitor()` are unaffected |
+| `PageReader` | Operates on file-type data; no awareness of requested type |
+| `StringColumnReader` | Used as inner reader unchanged for VARCHAR→numeric and numeric→VARCHAR |
+| `IntegerColumnReader` | Used as inner reader for int→float and int→string; its existing widening path is unaffected |
+| `StructColumnReader` | Recursion through `ParquetColumnReader::build()` handles element-level wrapping automatically |
+| `TimestampColumnReader` | Used as inner reader for TIMESTAMP→BIGINT; wrapper extracts epoch seconds |
+
+### Integration Test Cases Specific to Parquet
+
+In addition to the conversion pairs already covered for DWRF, Parquet integration
+tests must additionally cover:
+
+1. **Dictionary → plain page switch with conversion**: Write a column chunk that
+   starts with a dictionary page and continues with plain pages. Verify that
+   after `dedictionarize()` is forwarded, conversion continues correctly on plain
+   values.
+
+2. **Multi-row-group file**: Verify that row group skipping is disabled for
+   cross-domain conversions (all row groups are scanned) and enabled for safe
+   widening (row groups with non-matching min/max are skipped).
+
+3. **DELTA\_BINARY\_PACKED integer with conversion**: Write an integer column with
+   delta encoding (`hasBulkPath()` returns false). Verify that the visitor path
+   inside `IntegerColumnReader` still produces correct values that the wrapper
+   converts accurately.
+
+4. **Decimal scale narrowing**: Write a DECIMAL(10,4) column, read as DECIMAL(10,2).
+   Verify that values whose truncated representation overflows the target precision
+   are nulled.
+
+5. **INT96 timestamp → BIGINT**: Write an INT96-encoded timestamp column. Verify
+   that `TimestampColumnReader<int128_t>` decodes correctly and the wrapper
+   extracts epoch seconds into a BIGINT vector.
+
+6. **Nested column conversion** (ARRAY\<INT\> → ARRAY\<BIGINT\>): Verify that
+   the list reader is unchanged and only the element reader is wrapped. Null list
+   entries must be correctly propagated through the element wrapper.
