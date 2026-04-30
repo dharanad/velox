@@ -10,6 +10,14 @@ When asked to review a PR (via `/pr-review`), always use the /pr-review skill.
 
 When asked a question about the PR or codebase (via `/query`), use the /query skill.
 
+## Module Documentation
+
+When asked to document a module (via `/module-doc <path>`), use the /module-doc skill.
+
+## Assignments
+
+When asked to create a learning assignment from a design document (via `/assignment <doc-path>`), use the /assignment skill.
+
 ## Overview
 
 Velox is an open source C++ library for composable data processing and
