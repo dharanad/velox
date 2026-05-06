@@ -1091,6 +1091,219 @@ TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithExtraFilter) {
   }
 }
 
+TEST_P(MultiThreadedHashJoinTest, rightAntiJoin) {
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(numDrivers_)
+      .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+      .probeType(probeType_)
+      .probeVectors(133, 3)
+      .probeKeys({"t_k1"})
+      .buildType(buildType_)
+      .buildVectors(174, 4)
+      .buildKeys({"u_k1"})
+      .joinType(core::JoinType::kRightAnti)
+      .joinOutputLayout({"u_k2"})
+      .referenceQuery(
+          "SELECT u_k2 FROM u WHERE NOT EXISTS (SELECT * FROM t WHERE u_k1 = t_k1)")
+      .run();
+}
+
+TEST_P(MultiThreadedHashJoinTest, rightAntiJoinWithEmptyBuild) {
+  const std::vector<bool> finishOnEmptys = {false, true};
+  for (const auto finishOnEmpty : finishOnEmptys) {
+    SCOPED_TRACE(fmt::format("finishOnEmpty: {}", finishOnEmpty));
+
+    std::vector<RowVectorPtr> probeVectors =
+        makeBatches(5, [&](uint32_t /*unused*/) {
+          return makeRowVector(
+              {"t0", "t1"},
+              {makeFlatVector<int32_t>(
+                   431, [](auto row) { return row % 11; }, nullEvery(13)),
+               makeFlatVector<int32_t>(431, [](auto row) { return row; })});
+        });
+
+    std::vector<RowVectorPtr> buildVectors =
+        makeBatches(5, [&](uint32_t /*unused*/) {
+          return makeRowVector(
+              {"u0", "u1"},
+              {
+                  makeFlatVector<int32_t>(
+                      434, [](auto row) { return row % 5; }, nullEvery(7)),
+                  makeFlatVector<int32_t>(434, [](auto row) { return row; }),
+              });
+        });
+
+    // Build side is filtered to empty: all build rows have no match →
+    // right anti returns nothing since build table is empty.
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .hashProbeFinishEarlyOnEmptyBuild(finishOnEmpty)
+        .numDrivers(numDrivers_)
+        .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+        .probeKeys({"t0"})
+        .probeVectors(std::move(probeVectors))
+        .buildKeys({"u0"})
+        .buildVectors(std::move(buildVectors))
+        .buildFilter("u0 < 0")
+        .joinType(core::JoinType::kRightAnti)
+        .joinOutputLayout({"u1"})
+        .referenceQuery(
+            "SELECT u.u1 FROM u WHERE u.u0 < 0 AND NOT EXISTS "
+            "(SELECT 1 FROM t WHERE t.t0 = u.u0)")
+        .checkSpillStats(false)
+        .run();
+  }
+}
+
+TEST_P(MultiThreadedHashJoinTest, rightAntiJoinWithEmptyProbe) {
+  // When probe side is empty, all build rows are returned.
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(3, [&](uint32_t /*unused*/) {
+        return makeRowVector(
+            {"t0", "t1"},
+            {
+                makeFlatVector<int32_t>(0, [](auto row) { return row; }),
+                makeFlatVector<int32_t>(0, [](auto row) { return row; }),
+            });
+      });
+
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](uint32_t /*unused*/) {
+        return makeRowVector(
+            {"u0", "u1"},
+            {makeFlatVector<int32_t>(
+                 100, [](auto row) { return row % 7; }, nullEvery(9)),
+             makeFlatVector<int32_t>(100, [](auto row) { return row; })});
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(numDrivers_)
+      .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+      .probeKeys({"t0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u0"})
+      .buildVectors(std::move(buildVectors))
+      .joinType(core::JoinType::kRightAnti)
+      .joinOutputLayout({"u1"})
+      .referenceQuery(
+          "SELECT u.u1 FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.t0 = u.u0)")
+      .run();
+}
+
+TEST_P(MultiThreadedHashJoinTest, rightAntiJoinWithAllMatches) {
+  // All build rows have a probe match → result should be empty.
+  std::vector<RowVectorPtr> probeVectors =
+      makeBatches(3, [&](uint32_t /*unused*/) {
+        return makeRowVector(
+            {"t0", "t1"},
+            {
+                makeFlatVector<int32_t>(100, [](auto row) { return row % 5; }),
+                makeFlatVector<int32_t>(100, [](auto row) { return row; }),
+            });
+      });
+
+  std::vector<RowVectorPtr> buildVectors =
+      makeBatches(3, [&](uint32_t /*unused*/) {
+        return makeRowVector(
+            {"u0", "u1"},
+            {makeFlatVector<int32_t>(50, [](auto row) { return row % 5; }),
+             makeFlatVector<int32_t>(50, [](auto row) { return row; })});
+      });
+
+  HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+      .numDrivers(numDrivers_)
+      .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+      .probeKeys({"t0"})
+      .probeVectors(std::move(probeVectors))
+      .buildKeys({"u0"})
+      .buildVectors(std::move(buildVectors))
+      .joinType(core::JoinType::kRightAnti)
+      .joinOutputLayout({"u1"})
+      .referenceQuery(
+          "SELECT u.u1 FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.t0 = u.u0)")
+      .run();
+}
+
+TEST_P(MultiThreadedHashJoinTest, rightAntiJoinWithFilter) {
+  auto probeVectors = makeBatches(4, [&](int32_t /*unused*/) {
+    return makeRowVector(
+        {"t0", "t1"},
+        {
+            makeFlatVector<int32_t>(345, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(345, [](auto row) { return row; }),
+        });
+  });
+
+  auto buildVectors = makeBatches(4, [&](int32_t /*unused*/) {
+    return makeRowVector(
+        {"u0", "u1"},
+        {
+            makeFlatVector<int32_t>(250, [](auto row) { return row; }),
+            makeFlatVector<int32_t>(250, [](auto row) { return row; }),
+        });
+  });
+
+  // Always true filter: no build row has an unmatched probe → empty result.
+  {
+    auto testProbeVectors = probeVectors;
+    auto testBuildVectors = buildVectors;
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(numDrivers_)
+        .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+        .probeKeys({"t0"})
+        .probeVectors(std::move(testProbeVectors))
+        .buildKeys({"u0"})
+        .buildVectors(std::move(testBuildVectors))
+        .joinType(core::JoinType::kRightAnti)
+        .joinFilter("t1 > -1")
+        .joinOutputLayout({"u0", "u1"})
+        .referenceQuery(
+            "SELECT u.* FROM u WHERE NOT EXISTS "
+            "(SELECT 1 FROM t WHERE u0 = t0 AND t1 > -1)")
+        .run();
+  }
+
+  // Always false filter: filter never passes → no effective match → all
+  // build rows are returned.
+  {
+    auto testProbeVectors = probeVectors;
+    auto testBuildVectors = buildVectors;
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(numDrivers_)
+        .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+        .probeKeys({"t0"})
+        .probeVectors(std::move(testProbeVectors))
+        .buildKeys({"u0"})
+        .buildVectors(std::move(testBuildVectors))
+        .joinType(core::JoinType::kRightAnti)
+        .joinFilter("t1 > 100000")
+        .joinOutputLayout({"u0", "u1"})
+        .referenceQuery(
+            "SELECT u.* FROM u WHERE NOT EXISTS "
+            "(SELECT 1 FROM t WHERE u0 = t0 AND t1 > 100000)")
+        .run();
+  }
+
+  // Selective filter.
+  {
+    auto testProbeVectors = probeVectors;
+    auto testBuildVectors = buildVectors;
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(numDrivers_)
+        .parallelizeJoinBuildRows(parallelBuildSideRowsEnabled_)
+        .probeKeys({"t0"})
+        .probeVectors(std::move(testProbeVectors))
+        .buildKeys({"u0"})
+        .buildVectors(std::move(testBuildVectors))
+        .joinType(core::JoinType::kRightAnti)
+        .joinFilter("t1 % 5 = 0")
+        .joinOutputLayout({"u0", "u1"})
+        .referenceQuery(
+            "SELECT u.* FROM u WHERE NOT EXISTS "
+            "(SELECT 1 FROM t WHERE u0 = t0 AND t1 % 5 = 0)")
+        .run();
+  }
+}
+
 TEST_P(MultiThreadedHashJoinTest, semiFilterOverLazyVectors) {
   auto probeVectors = makeBatches(1, [&](auto /*unused*/) {
     return makeRowVector(
