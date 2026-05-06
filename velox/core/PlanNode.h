@@ -3026,7 +3026,11 @@ enum class JoinType {
   // EXCEPT ALL semantics.
   kCountingAnti = 10,
 
-  kNumJoinTypes = 11,
+  // Opposite of kAnti. Return each row from the right side which has no match
+  // on the left side. Output contains only right-side columns.
+  kRightAnti = 11,
+
+  kNumJoinTypes = 12,
 };
 
 VELOX_DECLARE_ENUM_NAME(JoinType);
@@ -3065,6 +3069,10 @@ inline bool isRightSemiProjectJoin(JoinType joinType) {
 
 inline bool isAntiJoin(JoinType joinType) {
   return joinType == JoinType::kAnti;
+}
+
+inline bool isRightAntiJoin(JoinType joinType) {
+  return joinType == JoinType::kRightAnti;
 }
 
 inline bool isCountingAntiJoin(JoinType joinType) {

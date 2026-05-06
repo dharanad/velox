@@ -1557,9 +1557,11 @@ void AbstractJoinNode::validate() const {
     VELOX_CHECK(!rightType->containsChild(name));
   }
 
-  // Output of right semi join cannot include columns from the left side.
+  // Output of right semi and right anti joins cannot include columns from the
+  // left side.
   bool outputMayIncludeLeftColumns =
-      !(isRightSemiFilterJoin() || isRightSemiProjectJoin());
+      !(isRightSemiFilterJoin() || isRightSemiProjectJoin() ||
+        isRightAntiJoin());
 
   // Output of left semi and anti joins cannot include columns from the right
   // side.
@@ -1628,6 +1630,7 @@ const auto& joinTypeNames() {
       {JoinType::kAnti, "ANTI"},
       {JoinType::kCountingAnti, "COUNTING ANTI"},
       {JoinType::kCountingLeftSemiFilter, "COUNTING LEFT SEMI (FILTER)"},
+      {JoinType::kRightAnti, "RIGHT ANTI"},
   };
   return kNames;
 }
@@ -1772,6 +1775,7 @@ bool MergeJoinNode::isSupported(JoinType joinType) {
     case JoinType::kLeftSemiFilter:
     case JoinType::kRightSemiFilter:
     case JoinType::kAnti:
+    case JoinType::kRightAnti:
     case JoinType::kFull:
       return true;
 

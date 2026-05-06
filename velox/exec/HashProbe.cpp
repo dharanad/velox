@@ -486,7 +486,7 @@ void HashProbe::asyncWaitForHashTable() {
        isCountingLeftSemiFilterJoin(joinType_) ||
        isRightSemiFilterJoin(joinType_) ||
        (isRightSemiProjectJoin(joinType_) && !nullAware_) ||
-       isRightJoin(joinType_)) &&
+       isRightJoin(joinType_) || isRightAntiJoin(joinType_)) &&
       table_->hashMode() != BaseHashTable::HashMode::kHash && !isSpillInput() &&
       operatorCtx_->driverCtx()
           ->queryConfig()
@@ -924,6 +924,14 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
           RowContainer::kUnlimited,
           outputTableRows);
 
+    } else if (isRightAntiJoin(joinType_)) {
+      // Right anti join outputs build rows that had no match on the probe side.
+      numOut = table_->listNotProbedRows(
+          lastProbeIterator_,
+          buildSideOutputRowContainerId_,
+          outputTableRowsCapacity_,
+          RowContainer::kUnlimited,
+          outputTableRows);
     } else {
       // Must be a right join or full join.
       numOut = table_->listNotProbedRows(
@@ -994,7 +1002,8 @@ bool HashProbe::needLastProbe() const {
 bool HashProbe::skipProbeOnEmptyBuild() const {
   return isInnerJoin(joinType_) || isLeftSemiFilterJoin(joinType_) ||
       isCountingLeftSemiFilterJoin(joinType_) || isRightJoin(joinType_) ||
-      isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_);
+      isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_) ||
+      isRightAntiJoin(joinType_);
 }
 
 bool HashProbe::canSpill() const {
@@ -1286,9 +1295,10 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
       table_->rows()->setProbedFlag(outputTableRows, numOut);
     }
 
-    // Right semi join only returns the build side output when the probe side
-    // is fully complete. Do not return anything here.
-    if (isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_)) {
+    // Right semi and right anti joins only return build side output after all
+    // probe input is processed. Do not return anything here.
+    if (isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_) ||
+        isRightAntiJoin(joinType_)) {
       if (resultIter_->atEnd()) {
         input_ = nullptr;
       }
@@ -2261,7 +2271,8 @@ void HashProbe::spillOutput() {
       break;
     }
     VELOX_CHECK(
-        isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_));
+        isRightSemiFilterJoin(joinType_) || isRightSemiProjectJoin(joinType_) ||
+        isRightAntiJoin(joinType_));
     VELOX_CHECK((output == nullptr) && (input_ != nullptr));
   }
   VELOX_CHECK_LE(outputSpiller->state().spilledPartitionIdSet().size(), 1);

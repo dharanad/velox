@@ -95,10 +95,11 @@ void MergeJoin::initialize() {
     }
   }
 
-  if (joinNode_->isRightSemiFilterJoin()) {
+  if (joinNode_->isRightSemiFilterJoin() || joinNode_->isRightAntiJoin()) {
     VELOX_USER_CHECK(
         leftProjections_.empty(),
-        "The left side projections should be empty for right semi join");
+        "The left side projections should be empty for right semi and right "
+        "anti join");
   }
 
   for (auto i = 0; i < rightType->size(); ++i) {
@@ -120,12 +121,16 @@ void MergeJoin::initialize() {
 
     if (joinNode_->isLeftJoin() || joinNode_->isAntiJoin() ||
         joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
-        isSemiFilterJoin(joinType_)) {
+        isSemiFilterJoin(joinType_) || joinNode_->isRightAntiJoin()) {
       joinTracker_ = JoinTracker(preferredOutputBatchRows_, pool());
     }
   } else if (joinNode_->isAntiJoin()) {
     // Anti join needs to track the left side rows that have no match on the
     // right.
+    joinTracker_ = JoinTracker(preferredOutputBatchRows_, pool());
+  } else if (joinNode_->isRightAntiJoin()) {
+    // Right anti join needs to track the right side rows that have no match on
+    // the left.
     joinTracker_ = JoinTracker(preferredOutputBatchRows_, pool());
   }
 
@@ -361,7 +366,9 @@ bool MergeJoin::tryAddOutputRowForLeftJoin() {
 }
 
 bool MergeJoin::tryAddOutputRowForRightJoin() {
-  VELOX_CHECK(isRightJoin(joinType_) || isFullJoin(joinType_));
+  VELOX_CHECK(
+      isRightJoin(joinType_) || isFullJoin(joinType_) ||
+      isRightAntiJoin(joinType_));
   if (outputSize_ == outputBatchSize_) {
     return false;
   }
@@ -445,7 +452,8 @@ bool MergeJoin::tryAddOutputRow(
         filterRightInputProjections_);
 
     if (joinTracker_) {
-      if (isRightJoin(joinType_) || isRightSemiFilterJoin(joinType_)) {
+      if (isRightJoin(joinType_) || isRightSemiFilterJoin(joinType_) ||
+          isRightAntiJoin(joinType_)) {
         // Record right-side row with a match on the left-side.
         joinTracker_->addMatch(rightBatch, rightRow, outputSize_);
       } else {
@@ -478,7 +486,8 @@ bool MergeJoin::prepareOutput(
       return true;
     }
 
-    if (isRightJoin(joinType_) && right != currentRight_) {
+    if ((isRightJoin(joinType_) || isRightAntiJoin(joinType_)) &&
+        right != currentRight_) {
       return true;
     }
 
@@ -594,6 +603,18 @@ bool MergeJoin::prepareOutput(
 }
 
 bool MergeJoin::addToOutput() {
+  if (isRightAntiJoin(joinType_)) {
+    if (filter_) {
+      // With a filter, emit all matched right+left combinations so the filter
+      // can be evaluated. Rows that pass the filter are tracked by
+      // joinTracker_ as "matched" and later removed by filterOutputForAntiJoin.
+      return addToOutputForRightJoin();
+    }
+    // Without a filter, all key-matched right rows are suppressed.
+    leftMatch_.reset();
+    rightMatch_.reset();
+    return false;
+  }
   if (isRightJoin(joinType_) || isRightSemiFilterJoin(joinType_)) {
     return addToOutputForRightJoin();
   } else {
@@ -785,7 +806,7 @@ RowVectorPtr MergeJoin::getOutput() {
         continue;
       }
 
-      if (!isAntiJoin(joinType_)) {
+      if (!isAntiJoin(joinType_) && !isRightAntiJoin(joinType_)) {
         return output;
       }
 
@@ -827,13 +848,16 @@ bool MergeJoin::processDrain() {
     if (isLeftJoin(joinType_) || isAntiJoin(joinType_)) {
       operatorCtx_->task()->dropInput(rightNodeId_);
     }
+    if (isRightAntiJoin(joinType_)) {
+      operatorCtx_->task()->dropInput(rightNodeId_);
+    }
   }
 
   if (rightHasDrained_ && !rightInput_) {
     if (isInnerJoin(joinType_) && (!leftMatch_ || leftMatch_->complete)) {
       operatorCtx_->task()->dropInput(this);
     }
-    if (isRightJoin(joinType_)) {
+    if (isRightJoin(joinType_) || isRightAntiJoin(joinType_)) {
       operatorCtx_->task()->dropInput(this);
     }
   }
@@ -860,7 +884,8 @@ bool MergeJoin::getNextFromRightSide() {
     }
 
     if (rightInput_) {
-      if (isFullJoin(joinType_) || isRightJoin(joinType_)) {
+      if (isFullJoin(joinType_) || isRightJoin(joinType_) ||
+          isRightAntiJoin(joinType_)) {
         rightRowIndex_ = 0;
       } else {
         rightRowIndex_ = firstNonNull(rightInput_, rightKeyChannels_);
@@ -877,7 +902,8 @@ bool MergeJoin::getNextFromRightSide() {
 }
 
 RowVectorPtr MergeJoin::handleRightSideNullRows() {
-  if (!isRightJoin(joinType_) && !isFullJoin(joinType_)) {
+  if (!isRightJoin(joinType_) && !isFullJoin(joinType_) &&
+      !isRightAntiJoin(joinType_)) {
     return nullptr;
   }
   const auto rightFirstNonNullIndex =
@@ -982,7 +1008,8 @@ RowVectorPtr MergeJoin::doGetOutput() {
 
     // Catch up rightInput_ with input_.
     while (compareResult > 0) {
-      if (isRightJoin(joinType_) || isFullJoin(joinType_)) {
+      if (isRightJoin(joinType_) || isFullJoin(joinType_) ||
+          isRightAntiJoin(joinType_)) {
         // If output_ is currently wrapping a different buffer, return it
         // first.
         if (prepareOutput(nullptr, rightInput_)) {
@@ -1049,7 +1076,10 @@ RowVectorPtr MergeJoin::doGetOutput() {
       }
 
       leftRowIndex_ = leftEndRow;
-      if (isFullJoin(joinType_) || isRightJoin(joinType_)) {
+      if (isFullJoin(joinType_) || isRightJoin(joinType_) ||
+          isRightAntiJoin(joinType_)) {
+        // For right anti join, skip all matched right rows (they have a match
+        // on the left and are not emitted).
         rightRowIndex_ = rightEndRow;
       } else {
         rightRowIndex_ =
@@ -1109,7 +1139,7 @@ RowVectorPtr MergeJoin::handleSingleSideOutput() {
         clearRightInput();
       }
     }
-  } else if (isRightJoin(joinType_)) {
+  } else if (isRightJoin(joinType_) || isRightAntiJoin(joinType_)) {
     if (rightInput_ && leftHasNoInput()) {
       // If output_ is currently wrapping a different buffer, return it
       // first.
@@ -1502,7 +1532,7 @@ void MergeJoin::evaluateFilter(const SelectivityVector& rows) {
 }
 
 bool MergeJoin::isFinished() {
-  if (isRightJoin(joinType_)) {
+  if (isRightJoin(joinType_) || isRightAntiJoin(joinType_)) {
     // If all rows on both the left and right sides match, we must also verify
     // the 'noMoreInput_' on the left side to ensure that all results are
     // complete.
