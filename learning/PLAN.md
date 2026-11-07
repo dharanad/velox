@@ -36,11 +36,17 @@ operators**, and contribute upstream in those areas.
 ## Sizing
 
 Every assignment has a size, and larger ones are split into checkpoints so they
-can be spread over weekday sessions.
+can be spread over weekday sessions. Each checkpoint states its required work
+and acceptance criteria; extra depth belongs in explicit stretch goals.
 
 - **S** — up to 2 hours. A weekday evening.
 - **M** — half a day, or 2–3 weekday sessions by checkpoint.
 - **L** — a weekend push.
+
+These are estimates of active work, excluding dependency installation and cold
+builds. Rebuild sizes are provisional until the exact methods to remove are
+listed. Split work that exceeds its estimate into independently reviewable
+checkpoints before starting it.
 
 ## Tracking
 
@@ -58,15 +64,28 @@ that goes upstream, `#N` would point at an upstream issue.
 1. Claude writes `learning/assignments/NN-<topic>.md` with the goal, reading
    list, tasks, acceptance criteria, checkpoints, and stretch goals, and links
    it from the issue. Status moves to In Progress.
-2. For rebuilds, Claude makes the hollow-out commit.
-3. You implement and commit (`learning: NN <what>`).
+2. For rebuilds, first agree on the exact methods to remove and revise the
+   size if needed. You describe their contract, invariants, ownership rules,
+   and expected edge cases before Claude makes the hollow-out commit. Remove
+   only those methods, keeping surrounding code as context.
+3. You implement and commit (`learning: NN <what>`). For rebuilds, add at
+   least one test case of your own, motivated by the contract or an edge case
+   rather than copied from the implementation.
 4. Ask for a review (`review NN`). Status moves to In Review. Iterate until
    clean.
 5. **Debrief.** For rebuilds, compare against the original with
    `git diff <hollow-commit>^ -- <file>`. Claude asks 3–5 questions on the
-   design choices behind the upstream code.
+   design choices behind the upstream code, including what your new test
+   covers and why.
 6. Update `PROGRESS.md` with the date, hints used, and key takeaways. The
    final commit closes the issue, and Status moves to Done.
+7. **Delayed recall.** About a week later, spend 15–20 minutes answering 3–5
+   questions or sketching the data flow without opening the source or notes.
+   Then check your answers and record gaps and corrections in `PROGRESS.md`.
+   Revisit weak areas at the next check. Focus on structure, ownership, and
+   invariants; exact API names and signatures can be looked up afterward.
+   This is a follow-up to a completed assignment, not a gate on starting the
+   next one.
 
 ## Curriculum
 
@@ -78,25 +97,45 @@ tracks, which are where most of the time goes.
 | # | Assignment | Format | Size |
 |---|---|---|---|
 | F0 | Build, test, and debug loop; `learning/` CMake target | Extend | S |
-| F1 | Vectors by hand: every encoding without VectorMaker | Extend | M |
+| F1 | Vectors by hand: every encoding without VectorMaker | Extend | L |
+| F1a | [One query end to end](assignments/F1a-query-walkthrough.md): input vectors, filter/project, aggregation, and output | Explain | S |
 | F2 | `DecodedVector` | Rebuild | M |
 | F3 | `SelectivityVector`, `EvalCtx`, and the ensure-writable contract | Explain + Extend | S |
 
 Reading: `velox/docs/develop/vectors.rst`, `dictionary-encoding.rst`,
 `types.rst`, `memory.rst` (pools only).
 
+Do F1a immediately after F1. Revisit the same query in X1 to connect the
+visible data flow to tasks, drivers, operators, and blocking.
+
 ### Phase S — Scalar functions (expert track)
 
 | # | Assignment | Format | Size |
 |---|---|---|---|
-| S1 | Simple function API in depth: null behavior (`call`, `callNullable`, `callNullFree`), `initialize` with constant arguments, ASCII fast paths, string writers and zero-copy reuse, complex output types | Extend | M |
-| S2 | The same function as a `VectorFunction`: signatures, flat and constant fast paths, `applyToSelectedNoThrow`, error handling with `EvalCtx` | Extend + Perf | M |
+| S1a | Simple function null behavior (`call`, `callNullable`, `callNullFree`) and `initialize` with constant arguments | Extend | M |
+| S1b | String writers, ownership and zero-copy reuse, ASCII paths; a small benchmark baseline | Extend + Perf | M |
+| S1c | Complex output types and their view/writer contracts | Extend | S |
+| S2 | The S1b function as a `VectorFunction`: signatures, flat and constant fast paths, `applyToSelectedNoThrow`, error handling with `EvalCtx` | Extend + Perf | M |
 | S3 | `SimpleFunctionAdapter` internals | Rebuild | L |
 | S4 | Expression evaluation: default null propagation, peeling, constant folding, CSE, AND/OR, TRY | Explain + Debug | M |
 | S5 | Lambda functions and `FunctionVector` (`transform`, `filter`) | Rebuild | M |
 
 Reading: `scalar-functions.rst`, `view-and-writer-types.rst`,
 `expression-evaluation.rst`, `lambda-functions.rst`.
+
+The S1 checkpoints have separate acceptance criteria:
+
+| Checkpoint | Required evidence |
+|---|---|
+| S1a — Null behavior | Tests for each call contract, including null inputs, plus an explanation of when each contract is appropriate. |
+| S1a — Initialization | Tests with constant and varying arguments, plus an explanation of what can be prepared once and what remains per-row work. |
+| S1b — Strings | Tests for empty, short, long, ASCII, and non-ASCII strings; explain output ownership, reuse lifetimes, and ASCII-path selection. |
+| S1b — Measurement | Benchmark a fixed workload with flat and constant inputs and at least two null distributions. Record build mode, input sizes, repeated timings, and correctness checks outside the timed region; explain results without requiring a speedup. |
+| S1c — Complex outputs | Tests for null and empty containers and null elements, plus an explanation of the writer lifecycle and ownership. |
+
+S1b stretch goals: optimize the measured bottleneck or add a specialized ASCII
+path where the chosen function permits one. Keep the baseline for comparison.
+S2 reuses that workload to compare the two implementations.
 
 ### Phase A — Aggregate functions (expert track)
 
@@ -115,6 +154,10 @@ Reading: `aggregate-functions.rst`, `aggregations.rst`, `arena.rst`.
 |---|---|---|---|
 | X1 | `PlanBuilder`, `Task`, `Driver`, `Operator` lifecycle, and `isBlocked`/futures | Explain | S |
 | X2 | A custom operator plugged in through `PlanNodeTranslator` | Extend | M |
+
+In X1, revisit F1a's query and annotate the sketch with the task, driver, and
+operator lifecycle and any blocking boundaries. Explain any intermediate
+vectors that differ from the original sketch.
 
 Reading: `task.rst`, `operators.rst`.
 
@@ -147,6 +190,7 @@ Reading: `joins.rst`, `anti-join.rst`, `hash-table-caching.rst`.
 
 Pick open upstream issues in functions, aggregates, aggregation, or joins.
 Claude acts as a pre-review before you open the PR.
+Upstream contribution work starts here, after the learning phases.
 
 ## Order
 

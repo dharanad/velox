@@ -1,6 +1,9 @@
 # F1 — Vectors by hand
 
-**Format:** Extend · **Size:** M (6 checkpoints, each fits a weekday session)
+**Format:** Extend · **Size:** L overall (6 checkpoints, each targeted at one weekday session)
+
+After completion, continue with
+[F1a — One query end to end](F1a-query-walkthrough.md).
 
 ## Goal
 
@@ -58,3 +61,15 @@ memory layout of any vector from memory.
 - Build a `LazyVector` with a loader you write, and observe when it loads.
 - Call `BaseVector::flattenVector` on your nested dictionary and explain what
   it did to the buffers.
+
+## Delayed recall
+
+About a week after completion, answer these without source or notes, then
+check your answers and record corrections in `PROGRESS.md`:
+
+1. Sketch a dictionary vector's buffers and map a row through two layers.
+2. Explain how nulls at each dictionary layer affect the result.
+3. Explain who owns the bytes behind a long `StringView` and their lifetime.
+4. Outline the sum traversal for nested dictionaries without `DecodedVector`.
+
+This check does not delay F1a or later assignments.

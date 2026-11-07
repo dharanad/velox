@@ -27,6 +27,9 @@ depends on how fast this loop is.
    `make debug TARGETS=velox_vector_test EXTRA_CMAKE_FLAGS="-DVELOX_ENABLE_GROUPED_TESTS=OFF"`
 2. Note the cold build time and `ccache -s` before and after.
 3. Run `DecodedVectorTest` on its own with `--gtest_filter`.
+4. Record the OS, CPU, RAM, compiler, CMake, build tool, and debugger versions,
+   along with the exact configure, build, and test commands in `PROGRESS.md`.
+   Measure configuration, compilation/linking, and test execution separately.
 
 ### Checkpoint 2 — Trim the build (optional but worth it)
 
@@ -34,6 +37,8 @@ Find which `VELOX_ENABLE_*` options in the root `CMakeLists.txt` you can turn
 off without losing anything the curriculum needs. Keep scalar functions,
 aggregates, exec, and enough of a connector for `HashJoinTest` and
 `AggregationTest` to build. Write the final configure line in `PROGRESS.md`.
+Time-box this exploration to one hour. If the existing configuration works,
+record remaining ideas and continue with the learning target.
 
 ### Checkpoint 3 — The `learning/` target
 
@@ -44,6 +49,7 @@ aggregates, exec, and enough of a connector for `HashJoinTest` and
 3. Add `learning/LearningSmokeTest.cpp` with one test that builds a small
    vector through `VectorTestBase` and checks it with a gtest matcher.
 4. Time the warm loop: change one line in the test, rebuild, and rerun.
+   Record rebuild time and test time separately, plus their combined time.
 
 ### Checkpoint 4 — Debugger
 
@@ -53,13 +59,17 @@ aggregates, exec, and enough of a connector for `HashJoinTest` and
    until you reach the branch that handles it.
 3. Make sure your editor (clangd or the VS Code C++ extension) resolves symbols
    through `_build/debug/compile_commands.json`.
+4. Record the debugger invocation, breakpoint, and editor configuration in
+   `PROGRESS.md` so you can reproduce the setup.
 
 ## Acceptance
 
 - `ctest -R velox_learning` passes.
-- The warm rebuild-and-run of `velox_learning_test` takes about a minute or
-  less.
-- The configure line and timings are recorded in `PROGRESS.md`.
+- The edit/build/test loop and debugger session work reproducibly.
+- A warm rebuild-and-run of about a minute or less is a target, not a pass/fail
+  requirement. Record the machine's baseline and any observed bottleneck.
+- The environment, exact commands, separate timings, and debugger setup are
+  recorded in `PROGRESS.md`.
 
 ## Questions for the debrief
 
