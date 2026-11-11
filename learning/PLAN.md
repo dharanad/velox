@@ -2,7 +2,8 @@
 
 Relearn Velox from the ground up by writing the code by hand, then become an
 expert in **scalar functions, aggregate functions, and the aggregation and join
-operators**, and contribute upstream in those areas.
+operators**. This is purely educational: nothing on this branch goes upstream,
+and upstream contributions are outside the curriculum.
 
 ## Ground rules
 
@@ -54,14 +55,15 @@ Each assignment is an issue on the fork (`dharanad/velox`, label `learning`),
 tracked on the private project
 [Velox Relearning](https://github.com/users/dharanad/projects/7) with the
 fields Status (Todo, In Progress, In Review, Done), Phase, Format, and Size.
-Review notes go in the issue comments.
+Issues and the project carry status only. `PROGRESS.md` is the single written
+record: review notes, hints used, takeaways, and recall results all go there.
 
 Reference issues with `Closes #N` only in commits on this branch. In a commit
 that goes upstream, `#N` would point at an upstream issue.
 
 ## Workflow per assignment
 
-1. Claude writes `learning/assignments/NN-<topic>.md` with the goal, reading
+1. Claude writes `learning/assignments/<id>-<topic>.md` with the goal, reading
    list, tasks, acceptance criteria, checkpoints, and stretch goals, and links
    it from the issue. Status moves to In Progress.
 2. For rebuilds, first agree on the exact methods to remove and revise the
@@ -71,15 +73,20 @@ that goes upstream, `#N` would point at an upstream issue.
 3. You implement and commit (`learning: NN <what>`). For rebuilds, add at
    least one test case of your own, motivated by the contract or an edge case
    rather than copied from the implementation.
-4. Ask for a review (`review NN`). Status moves to In Review. Iterate until
-   clean.
+4. Ask for a review (`review NN`). Status moves to In Review. Claude records
+   the review notes in `PROGRESS.md`. Iterate until clean.
 5. **Debrief.** For rebuilds, compare against the original with
    `git diff <hollow-commit>^ -- <file>`. Claude asks 3–5 questions on the
    design choices behind the upstream code, including what your new test
    covers and why.
-6. Update `PROGRESS.md` with the date, hints used, and key takeaways. The
+6. **Restore the original.** After a rebuild's debrief, tag your version
+   (`learning/<id>-mine`), then restore the upstream bodies with
+   `git checkout <hollow-commit>^ -- <file>` and commit
+   (`learning: NN restore upstream`). Keep the test you added if it passes
+   against the original. Later assignments then run on known-correct code.
+7. Update `PROGRESS.md` with the date, hints used, and key takeaways. The
    final commit closes the issue, and Status moves to Done.
-7. **Delayed recall.** About a week later, spend 15–20 minutes answering 3–5
+8. **Delayed recall.** About a week later, spend 15–20 minutes answering 3–5
    questions or sketching the data flow without opening the source or notes.
    Then check your answers and record gaps and corrections in `PROGRESS.md`.
    Revisit weak areas at the next check. Focus on structure, ownership, and
@@ -116,12 +123,19 @@ visible data flow to tasks, drivers, operators, and blocking.
 | S1b | String writers, ownership and zero-copy reuse, ASCII paths; a small benchmark baseline | Extend + Perf | M |
 | S1c | Complex output types and their view/writer contracts | Extend | S |
 | S2 | The S1b function as a `VectorFunction`: signatures, flat and constant fast paths, `applyToSelectedNoThrow`, error handling with `EvalCtx` | Extend + Perf | M |
-| S3 | `SimpleFunctionAdapter` internals | Rebuild | L |
+| S3 | `SimpleFunctionAdapter` internals: a mini-adapter in `learning/` for one or two signatures, then a guided read of the real adapter | Explain + Extend | M |
 | S4 | Expression evaluation: default null propagation, peeling, constant folding, CSE, AND/OR, TRY | Explain + Debug | M |
 | S5 | Lambda functions and `FunctionVector` (`transform`, `filter`) | Rebuild | M |
 
 Reading: `scalar-functions.rst`, `view-and-writer-types.rst`,
 `expression-evaluation.rst`, `lambda-functions.rst`.
+
+S3 is not a Rebuild. Every simple function instantiates
+`SimpleFunctionAdapter.h`, so hollowing it would rebuild the whole functions
+library on each edit and bury mistakes in template errors. Build the
+mini-adapter first (argument decoding, null handling, and writing results for
+the chosen signatures), then explain how the real adapter generalizes each
+piece.
 
 The S1 checkpoints have separate acceptance criteria:
 
@@ -148,18 +162,27 @@ S2 reuses that workload to compare the two implementations.
 
 Reading: `aggregate-functions.rst`, `aggregations.rst`, `arena.rst`.
 
+A2 opens with an Explain checkpoint on the accumulator row layout: where a
+`RowContainer` row keeps each accumulator, its null bit, and the
+initialized state, and what the offsets passed to an `Aggregate` mean. H2
+rebuilds `RowContainer` much later, so this checkpoint covers only what an
+aggregate author must know.
+
 ### Phase X — Execution core (prerequisite for H and J)
 
 | # | Assignment | Format | Size |
 |---|---|---|---|
 | X1 | `PlanBuilder`, `Task`, `Driver`, `Operator` lifecycle, and `isBlocked`/futures | Explain | S |
 | X2 | A custom operator plugged in through `PlanNodeTranslator` | Extend | M |
+| X3 | Memory beyond pools: arbitration, `Operator::reclaim`, and what makes an operator reclaimable | Explain | S |
 
 In X1, revisit F1a's query and annotate the sketch with the task, driver, and
 operator lifecycle and any blocking boundaries. Explain any intermediate
 vectors that differ from the original sketch.
 
-Reading: `task.rst`, `operators.rst`.
+X3 is the prerequisite for the spilling assignments, H6 and J4.
+
+Reading: `task.rst`, `operators.rst`, `memory.rst` (in full for X3).
 
 ### Phase H — Aggregation operator (expert track)
 
@@ -186,16 +209,10 @@ Reading: `hash-table.rst`, `spilling.rst`.
 
 Reading: `joins.rst`, `anti-join.rst`, `hash-table-caching.rst`.
 
-### Phase C — Contributing upstream
-
-Pick open upstream issues in functions, aggregates, aggregation, or joins.
-Claude acts as a pre-review before you open the PR.
-Upstream contribution work starts here, after the learning phases.
-
 ## Order
 
-F → S → A → X → H → J → C. S and A can be interleaved once F is done. H and J
-depend on X. The plan is a living document, so reorder or add assignments as
+F → S → A → X → H → J. S and A can be interleaved once F is done. H and J
+depend on X, and H6 and J4 depend on X3. The plan is a living document, so reorder or add assignments as
 interests shift.
 
 ## Branch mechanics
@@ -205,4 +222,6 @@ interests shift.
 - Rebase onto `upstream/main` only between phases, so a hollow-out commit is
   never rebased mid-assignment.
 - Your own code lives in `learning/`. Rebuild assignments edit real files in
-  `velox/` on this branch only.
+  `velox/` on this branch only, and those files return to their upstream
+  contents once the assignment is done, so `velox/` differs from `main` only
+  while a rebuild is in progress (plus any tests you added).

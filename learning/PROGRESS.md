@@ -6,8 +6,8 @@
 
 ## Takeaways
 
-Record anything that surprised you, design choices worth remembering, and the
-questions you got wrong in a debrief.
+Record anything that surprised you, design choices worth remembering, the
+questions you got wrong in a debrief, and the review notes for each assignment.
 
 ### F0
 
@@ -42,4 +42,4 @@ Record understanding of structure, ownership, and invariants; API spelling is
 not the goal. Follow up only on gaps, without delaying the next assignment.
 
 | Assignment | Completed | Recall due | Checked | Gaps and corrections | Revisit |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|

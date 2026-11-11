@@ -17,8 +17,9 @@ memory layout of any vector from memory.
 - `velox/docs/develop/vectors.rst` and `dictionary-encoding.rst`.
 - `velox/vector/BaseVector.h`, `FlatVector.h`, `ConstantVector.h`,
   `DictionaryVector.h`, `ComplexVector.h`.
-- `velox/buffer/Buffer.h` (`AlignedBuffer::allocate`) and
-  `velox/common/base/BitUtil.h` (null bits).
+- `velox/buffer/Buffer.h` (`AlignedBuffer::allocate`),
+  `velox/common/base/BitUtil.h` (bit access), and
+  `velox/common/base/Nulls.h` (null bits).
 - `velox/type/StringView.h`.
 
 ## Rules
