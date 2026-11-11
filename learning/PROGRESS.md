@@ -2,7 +2,7 @@
 
 | # | Started | Done | Hints used | Notes |
 |---|---|---|---|---|
-| F0 | | | | |
+| F0 | 2026-11-10 | 2026-11-11 | none | Checkpoints 1 and 3 done; 2 and 4 skipped as optional. |
 
 ## Takeaways
 
@@ -11,9 +11,7 @@ questions you got wrong in a debrief, and the review notes for each assignment.
 
 ### F0
 
-Record environment and toolchain versions, exact configure/build/test commands,
-configuration time, cold build time, warm rebuild time, test time, ccache
-statistics, and debugger/editor setup here. Timings are machine baselines.
+Keep the configure/build line you reuse. Anything else is optional.
 
 Environment
 OS = Ubuntu 22.04.5 LTS

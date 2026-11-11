@@ -65,7 +65,9 @@ that goes upstream, `#N` would point at an upstream issue.
 
 1. Claude writes `learning/assignments/<id>-<topic>.md` with the goal, reading
    list, tasks, acceptance criteria, checkpoints, and stretch goals, and links
-   it from the issue. Status moves to In Progress.
+   it from the issue. Specs are written one phase at a time, when the previous
+   phase is nearly done, so that they match the current code. Every checkpoint
+   states what to build, a "Done when" test, and a question to explain. Status moves to In Progress.
 2. For rebuilds, first agree on the exact methods to remove and revise the
    size if needed. You describe their contract, invariants, ownership rules,
    and expected edge cases before Claude makes the hollow-out commit. Remove
@@ -103,11 +105,11 @@ tracks, which are where most of the time goes.
 
 | # | Assignment | Format | Size |
 |---|---|---|---|
-| F0 | Build, test, and debug loop; `learning/` CMake target | Extend | S |
-| F1 | Vectors by hand: every encoding without VectorMaker | Extend | L |
+| F0 | [Build, test, and debug loop](assignments/F0-build-and-tooling.md); `learning/` CMake target | Extend | S |
+| F1 | [Vectors by hand](assignments/F1-vectors-by-hand.md): every encoding without VectorMaker | Extend | L |
 | F1a | [One query end to end](assignments/F1a-query-walkthrough.md): input vectors, filter/project, aggregation, and output | Explain | S |
-| F2 | `DecodedVector` | Rebuild | M |
-| F3 | `SelectivityVector`, `EvalCtx`, and the ensure-writable contract | Explain + Extend | S |
+| F2 | [`DecodedVector`](assignments/F2-decoded-vector.md) | Rebuild | M |
+| F3 | [`SelectivityVector`, `EvalCtx`, and the ensure-writable contract](assignments/F3-selectivity-and-evalctx.md) | Explain + Extend | S |
 
 Reading: `velox/docs/develop/vectors.rst`, `dictionary-encoding.rst`,
 `types.rst`, `memory.rst` (pools only).
