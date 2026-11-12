@@ -1,0 +1,97 @@
+SOCRATIC-TUTOR SAVE STATE
+topic: Velox Vectors (repo: velox)
+target: 4/5 on every subskill, then a final mixed assessment
+sessions so far: 2
+
+skill map:
+1 Hierarchy & encodings     2/5  (one check banked: constant must flatten)
+2 Buffers & memory          1/5  (untouched this session)
+3 Null representation       3/5  (was 4; failed review on dictionary nulls)
+4 Wrapping & decoding       3/5  (still needs unprompted recall of the read)
+5 Complex vector layout     3/5  (review question asked, not answered)
+6 SelectivityVector & lazy  3/5  (was 0)
+7 Ownership & mutability    3/5  (was 2)
+
+covered in session 1:
+- Flat vectors: one value slot per row, including null rows; values under
+nulls are undefined
+- Null bitmap polarity: bit 1 = not null (kNotNull = true,
+velox/common/base/Nulls.h)
+- mayHaveNulls(): false is certain (no buffer); true only means a buffer
+exists
+- ConstantVector: one isNull_ flag, all-null or no-null
+- Dictionary has its own nulls in addition to base nulls
+- RowVector nulls don't propagate to children; field access must merge them
+- Array layout: offsets/sizes/nulls/elements; offsets of empty or null rows
+are arbitrary
+- DecodedVector: base(), index(), merged nulls(), valueAt; isIdentityMapping,
+isConstantMapping
+- Writable = use_count()==1 AND buffers isMutable (unique && !isView);
+ensureWritable is copy-on-write
+
+covered in session 2:
+- Nested dictionary trace (D2 over D over flat): got indices {0,_,3,3} and the
+null row right unprompted
+- Reading a decoded value: decoded.valueAt<T>(row) ==
+decoded.data<T>()[decoded.index(row)]; T is required; row is the OUTER row.
+Had to be told after 3 attempts, then applied it correctly
+- Buggy loop values[row] on a decoded vector: can be right by accident where
+index(row) == row
+- index(row) under a null row is not to be relied on; check isNullAt first
+- SelectivityVector: bitmap, 1 = selected; begin() = first selected, end() =
+one past last selected (half-open); bounds do not cover holes, so use
+isValid or applyToSelected; updateBounds after setValid
+- if(cond, then, else): then and else get complementary SelectivityVectors and
+write into the same result at disjoint rows
+- Selected vs null: selected = caller needs the row; null = value unknown.
+Selected null input -> write NULL. Unselected row -> leave untouched
+- Vectors never compact: result keeps size 4 with an untouched slot at an
+unselected row
+- Wrote a correct divide over DecodedVector + SelectivityVector
+(decoded.isNullAt, decoded.valueAt<int64_t>(row), applyToSelected)
+- DictionaryVector::isNullAt checks wrapper nulls, then base nulls at the
+index (velox/vector/DictionaryVector-inl.h:96); decoded.isNullAt is preferred
+for cost, not correctness
+- LazyVector: holds a loader, loads on first need for the rows requested;
+derived "decode after filter, only surviving rows" unaided
+- loadedVector() on an unloaded lazy loads ALL rows;
+LazyVector::ensureLoadedRows(vector, rows) is the selective path
+- A LazyVector can be loaded at most once; columns referenced by more than one
+expression are loaded up front for all rows (multiplyReferencedFields_,
+velox/expression/Expr.cpp:2364). User proposed this fix unaided
+- Ownership: gave use_count()==1, then buffer refcount==1, without being told;
+predicted ensureWritable re-points a shared vector to a fresh copy
+- ensureWritable on a constant: becomes flat, 1 stored value -> 3 stored
+values
+
+misconceptions / weak spots:
+- (s1) Thought ConstantVector has per-row nulls (fixed)
+- (s1, recurred s2) Thinks rows disappear: flat-with-nulls holds fewer than
+size(); in s2 dropped an unselected row from the result and said size = 3.
+Corrected; re-test
+- (s2) Said c0->isNullAt(0) is false because the dictionary has no nulls
+buffer, forgetting the base's nulls. Corrected; re-test unprompted
+- (s2) Confused the then-branch and else-branch selections at first
+- (s2) Gave "Infinity" for 100 / NULL
+- (s2) Wrote c0->values() and rawValues[row] on a possibly-dictionary input
+while a DecodedVector was in scope
+- Habits: skips the last part of multi-part questions (many times in s2);
+answers with a method name or an edited snippet instead of answering the
+question asked; says "I see" without showing it. Ask one-part questions when
+a specific fact must be pinned down, and require the value, not the name
+
+spaced review due (unprompted):
+- complex layout: ArrayVector [[1,2], NULL, []], elements [1,2], sizes
+[2,0,0], offsets [0,7,9] - valid? why? (asked at the end of s2, unanswered;
+validateArrayVectorBase skips null and size-0 rows,
+velox/vector/ComplexVector.cpp:992)
+- nulls: can a vector with no nulls buffer of its own have a null row?
+- decoding: write the read expression from scratch, with T
+- selection: what is in the result at an unselected row, and result size
+- ownership: a failing case for each level, supplied by the user
+- lazy: which call loads all rows vs selected rows
+
+next: finish the pending array-offsets review, then one more round on 6
+(LazyVector wrapped in a dictionary after a filter; rows translated through
+the wrapper), then subskill 2 (buffers: AlignedBuffer, StringView inlining,
+memory pools), then subskill 1
