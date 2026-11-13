@@ -2,27 +2,78 @@
 topic: How operators work in Velox
 saved: 2026-11-14
 target level: 4/5 (default)
-phase: diagnostic, question 1 of 4 asked, not yet answered
+phase: teaching loop, subskill 2 (Operator contract); a re-test
+  question on noMoreInput() propagation is pending (see below)
 
-skill map (levels 0-5; "?" = not yet assessed):
-  1. Plan to operators (PlanNode -> Operator, pipelines, DriverFactory)   ?/5
+skill map (levels 0-5):
+  1. Plan to operators (PlanNode -> Operator, pipelines, DriverFactory)   2/5
   2. The Operator contract (needsInput, addInput, getOutput,
-     noMoreInput, isFinished)                                             ?/5
-  3. The Driver loop (how a Driver moves batches between operators)       ?/5
-  4. Blocking and yielding (isBlocked, ContinueFuture, off-thread)        ?/5
-  5. Source and sink operators (TableScan, Exchange, Values)              ?/5
+     noMoreInput, isFinished)                                             3/5  <- current focus
+  3. The Driver loop (how a Driver moves batches between operators)       2/5
+  4. Blocking and yielding (isBlocked, ContinueFuture, off-thread)        2/5
+  5. Source and sink operators (TableScan, Exchange, Values)              1/5
   6. Cross-pipeline operators (HashBuild/HashProbe, join bridges,
-     local exchange)                                                      ?/5
-  7. Operator state and memory (pools, reclaim/spill, lifecycle, close)   ?/5
-  8. Stats and writing your own (OperatorStats, custom operator)          ?/5
+     local exchange)                                                      1/5
+  7. Operator state and memory (pools, reclaim/spill, lifecycle, close)   0/5  (not probed)
+  8. Stats and writing your own (OperatorStats, custom operator)          0/5  (not probed)
 
-pending question (diagnostic 1 of 4):
-  For `SELECT a + 1 FROM t WHERE b > 10`: what operators do you expect
-  to exist, and how does a batch of rows physically get from one
-  operator to the next (who calls whom)?
+pending question (subskill 2, re-test of noMoreInput from a new angle):
+  Pipeline TableScan -> FilterProject -> OrderBy. TableScan just returned
+  its last batch and it has already been pushed through. Trace every
+  contract call the Driver makes, in order, until OrderBy hands out its
+  first sorted batch. Name the operator each call goes to.
+  Expected: TableScan getOutput -> nullptr, TableScan isFinished -> true,
+  FilterProject noMoreInput(); FilterProject getOutput -> nullptr,
+  isFinished -> true (noMoreInput_ && !input_), OrderBy noMoreInput()
+  (sorts); OrderBy getOutput -> first sorted batch. Note the loop walks
+  from the sink backward, so the exact interleaving is: visit OrderBy
+  first, then FilterProject, then TableScan; credit the causal chain.
 
-covered so far: nothing taught yet
-misconceptions noted: none observed yet
-next step: finish diagnostics 1-4, render the initial skill map,
-  propose a starting subskill
+diagnostic evidence:
+  D1: named TableScan -> FilterProject; Driver calls getOutput on the
+     producer and addInput on the consumer. Correct.
+  D2: "FilterProject::needsInput()" gates the handoff; did not mention
+     isBlocked checks.
+  D3: correct build/probe pipeline split; did not address Drivers per
+     pipeline; does not know the join bridge mechanism.
+  D4: Driver gives up the thread, callback re-enqueues it. Correct gist,
+     no names (isBlocked / BlockingReason / ContinueFuture).
+
+covered so far (subskill 2):
+  - needsInput()==false means FilterProject holds an unconsumed input_;
+    addInput is just `input_ = std::move(input)`, so ignoring
+    needsInput silently drops a batch. Answered unprompted. Correct.
+  - getOutput()==nullptr is ambiguous ("nothing now" vs. "done");
+    isFinished() disambiguates. FilterProject::isFinished is
+    noMoreInput_ && !input_. Correct (may have read the code).
+  - noMoreInput(): initially said the wrong direction ("downstream
+    finished -> call upstream noMoreInput"); corrected after a narrow
+    question (it goes to the operator that receives addInput, triggered
+    by the upstream finishing). Needs re-test -> pending question.
+  - Driver order: only calls isFinished() after getOutput() returned
+    nullptr (Driver.cpp:762, :824). Hence !input_ is redundant for
+    FilterProject today; kept so the promise "will never produce output
+    again" holds no matter when a caller asks. User stated the promise.
+  - OrderBy: getOutput nullptr before noMoreInput; after, ceil(N/batch)
+    batches plus one final nullptr call that sets finished_. User missed
+    the +1. needsInput() is !finished_ (stays true after noMoreInput,
+    harmless). Open thread: why that is safe -- revisit.
+
+misconceptions noted:
+  - Assumed the Driver checks isFinished() before getOutput() (wrong;
+    it is getOutput first, isFinished only on nullptr).
+  - noMoreInput direction confusion (fixed with help; re-testing).
+tutor notes:
+  - Two tutor questions were flawed and withdrawn (the "simplified
+    isFinished loses the last batch" scenario does not happen in the
+    current Driver). Verify claims in source before posing scenarios.
+  - Driver::runInternal (velox/exec/Driver.cpp ~L613) walks operators
+    from the sink backward; per (op, nextOp): op->isBlocked,
+    nextOp->isBlocked, nextOp->needsInput; if true op->getOutput ->
+    nextOp->addInput, i += 2; if null and op->isFinished(),
+    nextOp->noMoreInput(). needsInput false -> break (back-pressure).
+    Last operator: getOutput, then isFinished -> close, kAtEnd.
+next step: grade pending answer; if solid, test addInput/getOutput
+  interplay once more unprompted, consider 4/5 on subskill 2, then move
+  to subskill 3 (Driver loop).
 === END SAVE STATE ===
