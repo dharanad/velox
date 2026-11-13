@@ -1,16 +1,17 @@
 SOCRATIC-TUTOR SAVE STATE
 topic: Velox Vectors (repo: velox)
 target: 4/5 on every subskill, then a final mixed assessment
-sessions so far: 2
+sessions so far: 3
 
 skill map:
-1 Hierarchy & encodings     2/5  (one check banked: constant must flatten)
-2 Buffers & memory          1/5  (untouched this session)
-3 Null representation       3/5  (was 4; failed review on dictionary nulls)
-4 Wrapping & decoding       3/5  (still needs unprompted recall of the read)
-5 Complex vector layout     3/5  (review question asked, not answered)
-6 SelectivityVector & lazy  3/5  (was 0)
-7 Ownership & mutability    3/5  (was 2)
+1 Hierarchy & encodings     3/5  (was 2; wrapInConstant peeling learned)
+2 Buffers & memory          2/5  (was 1; first full pass done)
+3 Null representation       3/5  (one unprompted check banked: dict over
+                                  base nulls; failed wrapper-null direction)
+4 Wrapping & decoding       3/5  (review question asked, not answered)
+5 Complex vector layout     3/5  (one unprompted check banked: array offsets)
+6 SelectivityVector & lazy  3/5  (needed help on wrapper nulls; re-test)
+7 Ownership & mutability    3/5  (untouched this session)
 
 covered in session 1:
 - Flat vectors: one value slot per row, including null rows; values under
@@ -19,7 +20,7 @@ nulls are undefined
 velox/common/base/Nulls.h)
 - mayHaveNulls(): false is certain (no buffer); true only means a buffer
 exists
-- ConstantVector: one isNull_ flag, all-null or no-null
+- ConstantVector: isNull_ flag, all-null or no-null
 - Dictionary has its own nulls in addition to base nulls
 - RowVector nulls don't propagate to children; field access must merge them
 - Array layout: offsets/sizes/nulls/elements; offsets of empty or null rows
@@ -38,60 +39,98 @@ Had to be told after 3 attempts, then applied it correctly
 - Buggy loop values[row] on a decoded vector: can be right by accident where
 index(row) == row
 - index(row) under a null row is not to be relied on; check isNullAt first
-- SelectivityVector: bitmap, 1 = selected; begin() = first selected, end() =
-one past last selected (half-open); bounds do not cover holes, so use
-isValid or applyToSelected; updateBounds after setValid
-- if(cond, then, else): then and else get complementary SelectivityVectors and
-write into the same result at disjoint rows
-- Selected vs null: selected = caller needs the row; null = value unknown.
-Selected null input -> write NULL. Unselected row -> leave untouched
-- Vectors never compact: result keeps size 4 with an untouched slot at an
-unselected row
+- SelectivityVector: bitmap, 1 = selected; begin()/end() half-open bounds that
+do not cover holes; isValid / applyToSelected; updateBounds after setValid
+- if(cond, then, else): complementary SelectivityVectors, disjoint writes
+- Selected vs null; selected null input -> write NULL; unselected row ->
+leave untouched; vectors never compact
 - Wrote a correct divide over DecodedVector + SelectivityVector
-(decoded.isNullAt, decoded.valueAt<int64_t>(row), applyToSelected)
 - DictionaryVector::isNullAt checks wrapper nulls, then base nulls at the
-index (velox/vector/DictionaryVector-inl.h:96); decoded.isNullAt is preferred
-for cost, not correctness
-- LazyVector: holds a loader, loads on first need for the rows requested;
-derived "decode after filter, only surviving rows" unaided
-- loadedVector() on an unloaded lazy loads ALL rows;
-LazyVector::ensureLoadedRows(vector, rows) is the selective path
-- A LazyVector can be loaded at most once; columns referenced by more than one
-expression are loaded up front for all rows (multiplyReferencedFields_,
-velox/expression/Expr.cpp:2364). User proposed this fix unaided
-- Ownership: gave use_count()==1, then buffer refcount==1, without being told;
-predicted ensureWritable re-points a shared vector to a fresh copy
-- ensureWritable on a constant: becomes flat, 1 stored value -> 3 stored
-values
+index (velox/vector/DictionaryVector-inl.h:96)
+- LazyVector loads on first need; loadedVector() loads ALL rows;
+LazyVector::ensureLoadedRows(vector, rows) is the selective path; loaded at
+most once; multiply referenced fields loaded up front
+(velox/expression/Expr.cpp:2364)
+- ensureWritable on a constant: becomes flat, 1 stored value -> 3
+
+covered in session 3:
+- Array offsets review PASSED unprompted: [[1,2],NULL,[]] with offsets
+[0,7,9] is valid; validateArrayVectorBase skips rows where isNull || size==0
+(velox/vector/ComplexVector.cpp:1000). Null row with offset 7 size 5 also
+passes (first said it throws - misread; corrected via the guard)
+- ensureNullRowsEmpty() zeroes offsets/sizes of null rows (told, not tested)
+- Lazy under dictionary after a filter: base rows to load = {index(row) : row
+selected AND not decoded.isNullAt(row)} (selectBaseRowsToLoad,
+velox/vector/LazyVector.cpp). Got {1,6} for plain case unaided; FAILED the
+wrapper-null case 3 times (said base row 6 loads; then gave an outer row
+number); told; then got re-test (indices [5,5,2,7], null at 3, rows {0,1,3}
+-> {5}) and explained row 2 skipped because unselected
+- StringView: 16 B = 4 B size + 4 B prefix + 12 B inline or 8 B pointer.
+Recalled unprompted; corrected: inline is size <= 12 (kInlineSize), and the
+pointer points at the WHOLE string (prefix is a duplicate copy)
+- String bytes owned by FlatVector::stringBuffers_ (std::vector<BufferPtr>);
+BufferPtr = boost::intrusive_ptr<Buffer>, refcount inside Buffer
+(velox/buffer/Buffer.h:36, :312). User said "shared pointer" - corrected
+- Copying a long StringView out and dropping the vector -> size still 40,
+pointer dangles, s.str() is use-after-free UB. User first said "null or
+garbage" and called s a member of the vector; corrected. Inline "velox" case
+is safe - got unaided
+- AlignedBuffer: one pool->allocate; object placement-new'd at start (64 B
+header), data at this+1 (0x1000 -> 0x1040), simd padding + kEndGuard after.
+User did 0x1000+1 then 0x1064 (hex slip) before getting it
+- Buffer frees to its own pool_ because pools are accounting: usedBytes()
+is a counter; freeing to a wrong pool leaves A over-reporting, B under,
+leak log (velox/common/memory/MemoryPool.cpp:480). Got it after narrowing.
+Pool tree root/aggregate/leaf (told, not tested)
+- Null ConstantVector DOES allocate a 1-word nulls buffer set to kNull64
+(makeNullsBuffer, velox/vector/ConstantVector.h:467) - so rawNulls() !=
+nullptr. Session-1 note "one isNull_ flag" was incomplete
+- Dict with no own nulls over flat [10,NULL,30], indices {0,2,1} ->
+isNullAt(2) true. Unprompted (after constant ruled out)
+- wrapInConstant peels constant and dictionary layers (addConstant,
+velox/vector/BaseVector.cpp): constant's base is never constant/dictionary;
+null chosen row -> null constant with no base. Got valueAt(3)=10 unaided;
+first said valueVector() points to dict; after help traced D2 over D1:
+3 -> 1 -> 0
 
 misconceptions / weak spots:
 - (s1) Thought ConstantVector has per-row nulls (fixed)
-- (s1, recurred s2) Thinks rows disappear: flat-with-nulls holds fewer than
-size(); in s2 dropped an unselected row from the result and said size = 3.
-Corrected; re-test
-- (s2) Said c0->isNullAt(0) is false because the dictionary has no nulls
-buffer, forgetting the base's nulls. Corrected; re-test unprompted
-- (s2) Confused the then-branch and else-branch selections at first
+- (s1, s2) Thinks rows disappear / result shrinks under selection. Not
+re-tested in s3 - re-test
+- (s2, s3) Null layering: s2 ignored base nulls under a dictionary (fixed
+in s3, unprompted); s3 ignored WRAPPER nulls hiding the base row in lazy
+loading. Formula: isNullAt(row) = wrapperNull(row) ||
+base.isNullAt(index(row)). Re-test the wrapper direction unprompted
+- (s3) Mixes outer row numbers and base row numbers when asked for base rows
+- (s3) Stops index translation early (answered input index 3 for a
+two-layer peel)
+- (s3) Says "shared_ptr" for BufferPtr; called a copied StringView a member
+of the vector
+- (s3) Hex arithmetic slip (64 -> 0x64)
 - (s2) Gave "Infinity" for 100 / NULL
-- (s2) Wrote c0->values() and rawValues[row] on a possibly-dictionary input
-while a DecodedVector was in scope
-- Habits: skips the last part of multi-part questions (many times in s2);
-answers with a method name or an edited snippet instead of answering the
-question asked; says "I see" without showing it. Ask one-part questions when
-a specific fact must be pinned down, and require the value, not the name
+- (s2) Wrote c0->values()/rawValues[row] on possibly-dictionary input while
+a DecodedVector was in scope
+- Habits (persisting in s3): misreads changed premises in follow-up
+questions; answers with a method name or mechanism instead of the value
+asked ("usedBytes() tells me", "the string buffer"); skips last part of
+multi-part questions; hedges ("should be tied"). Keep questions one-part and
+demand the concrete value
 
 spaced review due (unprompted):
-- complex layout: ArrayVector [[1,2], NULL, []], elements [1,2], sizes
-[2,0,0], offsets [0,7,9] - valid? why? (asked at the end of s2, unanswered;
-validateArrayVectorBase skips null and size-0 rows,
-velox/vector/ComplexVector.cpp:992)
-- nulls: can a vector with no nulls buffer of its own have a null row?
-- decoding: write the read expression from scratch, with T
+- decoding (PENDING, asked at end of s3): write the read for a
+DecodedVector over BIGINT at a selected non-null row WITHOUT valueAt
+(answer: decoded.data<int64_t>()[decoded.index(row)])
+- nulls: wrapper null over a non-null base row - is it null? which base rows
+does loading touch?
 - selection: what is in the result at an unselected row, and result size
-- ownership: a failing case for each level, supplied by the user
 - lazy: which call loads all rows vs selected rows
+- ownership: a failing case for each level, supplied by the user
+- buffers: where does an AlignedBuffer's refcount live; why free to own pool
+- strings: when is keeping a StringView past its vector safe
 
-next: finish the pending array-offsets review, then one more round on 6
-(LazyVector wrapped in a dictionary after a filter; rows translated through
-the wrapper), then subskill 2 (buffers: AlignedBuffer, StringView inlining,
-memory pools), then subskill 1
+next: answer the pending decoding review, then subskill 2 round 2 (buffer
+views / BufferView + isView, reallocate, StringView inlining edge at exactly
+12 B, getBufferWithSpace and string buffer sharing via addStringBuffer),
+then subskill 7 refresh (ensureWritable on a vector whose string buffer is
+shared), then subskill 1 round 2 (encoding list; SEQUENCE/BIASED status;
+what DecodedVector does with each)
