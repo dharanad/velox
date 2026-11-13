@@ -1,85 +1,28 @@
-SOCRATIC-TUTOR SAVE STATE
-topic: Velox Operators, HashJoin, HashAggregation (repo: velox)
-target: 4/5 on every subskill, then a final mixed assessment
-sessions so far: 1
-order: A -> B -> C -> D (user accepted)
+=== SOCRATIC TUTOR SAVE STATE ===
+topic: How operators work in Velox
+saved: 2026-11-14
+target level: 4/5 (default)
+phase: diagnostic, question 1 of 4 asked, not yet answered
 
-skill map:
-A1 Plan -> pipelines -> drivers   2/5  (one check banked right after being
-                                       told: rewrote both pipelines correctly)
-A2 Operator contract              2/5  (two checks right after being told;
-                                       needs unprompted recall)
-A3 Driver loop, blocking          2/5  (deadlock derived unaided; future
-                                       recalled after narrowing)
-B4 RowContainer & HashTable       1/5  (not directly tested)
-C5 GroupingSet & Aggregate        1/5  (misconception pending, see below)
-C6 Aggregation under memory       0/5  (untested)
-D7 HashBuild & join bridge        1/5  (knew the name JoinBridge only)
-D8 HashProbe                      0/5  (untested)
-D9 Dynamic filters, spilling      0/5  (untested)
+skill map (levels 0-5; "?" = not yet assessed):
+  1. Plan to operators (PlanNode -> Operator, pipelines, DriverFactory)   ?/5
+  2. The Operator contract (needsInput, addInput, getOutput,
+     noMoreInput, isFinished)                                             ?/5
+  3. The Driver loop (how a Driver moves batches between operators)       ?/5
+  4. Blocking and yielding (isBlocked, ContinueFuture, off-thread)        ?/5
+  5. Source and sink operators (TableScan, Exchange, Values)              ?/5
+  6. Cross-pipeline operators (HashBuild/HashProbe, join bridges,
+     local exchange)                                                      ?/5
+  7. Operator state and memory (pools, reclaim/spill, lifecycle, close)   ?/5
+  8. Stats and writing your own (OperatorStats, custom operator)          ?/5
 
-diagnostic results:
-- Driver pulls with getOutput and pushes with addInput: correct, unprompted
-- Join plan: two pipelines, cut at the join: correct. Listed
-  {Scan(A) -> HashJoin -> Aggregation} and {Scan(B)}: no HashBuild, no
-  HashProbe
-- Where Scan(B)'s batch goes: "don't know, maybe JoinBridge"
-- State held by aggregation after k=[1,2,1], v=[10,20,30]: said a map
-  1 -> {10, 30}, 2 -> {20}
-- Probe before build is done: said "blocked", did not say what happens to
-  the thread
+pending question (diagnostic 1 of 4):
+  For `SELECT a + 1 FROM t WHERE b > 10`: what operators do you expect
+  to exist, and how does a batch of rows physically get from one
+  operator to the next (who calls whom)?
 
-covered in session 1:
-- One operator belongs to one pipeline and one driver (user derived this and
-  rejected their own HashJoin-in-two-pipelines picture)
-- HashJoinNode becomes two operators: HashBuild (last in the build pipeline)
-  and HashProbe (in the probe pipeline). Rewrote the pipelines correctly:
-  {Scan(A) -> HashProbe -> Aggregation}, {Scan(B) -> HashBuild}
-- HashBuild::getOutput returns nullptr: correct, unprompted
-- nullptr from getOutput only means "nothing right now"
-- The contract: needsInput, addInput, getOutput, isBlocked(future),
-  isFinished, noMoreInput. Told directly after 3 failed attempts at "how
-  does the driver know an operator is done"
-- FilterProject with every row filtered out: getOutput = nullptr,
-  needsInput = true, isFinished = false. Correct
-- noMoreInput: the driver tells the operator; called on the next operator
-  when the previous one reports isFinished. Told directly after 3 failed
-  attempts
-- Driver that never calls noMoreInput on aggregation: predicted the query
-  hangs with results computed but never emitted. Correct
-- 8 threads all held by blocked probe drivers: said deadlock, and that a
-  blocked driver must give up its thread. Correct, unaided
-- isBlocked returns a reason and a future; the driver attaches a callback
-  that puts it back on the executor queue, so nobody polls
-
-misconceptions / weak spots:
-- (diag, NOT yet corrected) Aggregation keeps the raw values per group,
-  1 -> {10, 30}. Lead the user to accumulators (running sum 40 and 20) at
-  the start of C5; ask about memory for a group with a billion rows
-- Tried to infer "done" from getOutput + needsInput, twice
-- Treated isFinished as information given to the operator, and inverted it
-  ("if isFinished is true, batch 6 will arrive"). Corrected; re-test
-- Said the future notifies HashProbe; it wakes the driver. Corrected
-- Said a parked driver's state "can be checked" without saying by whom
-- Habits carried over from the vectors course: answers a neighbouring
-  question instead of the one asked; names a method instead of giving the
-  value. Keep questions one-part and require the value
-
-pending question (asked at the end of s1, unanswered):
-- For the future HashProbe returned while waiting for the table: which
-  operator causes it to complete, and in which of its methods?
-  (HashBuild::noMoreInput, through the join bridge)
-
-spaced review due (unprompted):
-- contract: which method is the driver telling, not asking? when is it
-  called?
-- contract: values of getOutput / needsInput / isFinished / isBlocked for
-  HashProbe with pending output, and for HashProbe waiting for the table
-- pipelines: write the pipelines for a plan with two joins
-- blocking: what happens to the thread of a blocked driver, and how does
-  the driver get back on a thread
-
-next: the pending question, which opens D7 lightly; then finish A1 (number
-of drivers per pipeline, who turns plan nodes into operators: LocalPlanner,
-DriverFactory, Task) and A3 (the Driver::runInternal loop, yielding, the
-blocking reasons); then B4
+covered so far: nothing taught yet
+misconceptions noted: none observed yet
+next step: finish diagnostics 1-4, render the initial skill map,
+  propose a starting subskill
+=== END SAVE STATE ===
