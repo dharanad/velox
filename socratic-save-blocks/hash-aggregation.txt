@@ -1,0 +1,31 @@
+SOCRATIC-TUTOR SAVE STATE
+saved: 2026-11-14
+topic: How velox/exec/HashAggregation.h works (Velox HashAggregation operator)
+target level: 4/5 on every subskill
+phase: diagnostic, question 1 of 5 asked, not yet answered
+
+skill map (0-5; all unassessed, no levels earned yet):
+  1 Operator contract (needsInput/addInput/getOutput/noMoreInput/isBlocked/isFinished)  ?/5
+  2 Aggregation steps (single/partial/intermediate/final; raw vs intermediate input)    ?/5
+  3 GroupingSet delegation (operator vs hash table, row container, accumulators)        ?/5
+  4 Output production (resultIterator_, prepareOutput, row-size estimation)             ?/5
+  5 Partial aggregation adaptivity (partialFull_, flush, memory growth, abandonment)    ?/5
+  6 Distinct mode and input buffering (newDistincts_, input_, backpressure)             ?/5
+  7 Global and default grouping sets (isGlobal_, () set, peer election via future_)     ?/5
+  8 Memory reclaim and concurrency (spill, compaction, mutex_, arbitration thread)      ?/5
+
+pending question (diagnostic 1/5, targets subskills 1 and 4):
+  For SELECT k, sum(v) FROM t GROUP BY k in a single HashAggregation operator
+  (step kSingle), the Driver calls addInput() 100 times with 100 batches. At what
+  point does the first output row come out of getOutput(), and why can't it come
+  out any earlier?
+
+remaining diagnostic plan (not yet asked):
+  2/5 partial vs final step, what flows between them (subskills 2, 5)
+  3/5 what GroupingSet owns vs the operator (subskill 3)
+  4/5 why needsInput() checks input_ == nullptr (subskill 6)
+  5/5 global aggregation over empty input across multiple drivers (subskills 7, 8)
+
+misconceptions noted: none yet
+material covered: none (nothing taught; only the header has been read)
+notes: user answers from memory, not from the .cpp; one question at a time
