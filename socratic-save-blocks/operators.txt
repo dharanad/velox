@@ -1,9 +1,9 @@
 === SOCRATIC TUTOR SAVE STATE ===
 topic: How operators work in Velox
-saved: 2026-11-14
+saved: 2026-11-15
 target level: 4/5 (default)
-phase: teaching loop, subskill 2 (Operator contract); a re-test
-  question on noMoreInput() propagation is pending (see below)
+phase: teaching loop, subskill 2 (Operator contract); a full-trace
+  question with return values is pending (see below)
 
 skill map (levels 0-5):
   1. Plan to operators (PlanNode -> Operator, pipelines, DriverFactory)   2/5
@@ -17,17 +17,39 @@ skill map (levels 0-5):
   7. Operator state and memory (pools, reclaim/spill, lifecycle, close)   0/5  (not probed)
   8. Stats and writing your own (OperatorStats, custom operator)          0/5  (not probed)
 
-pending question (subskill 2, re-test of noMoreInput from a new angle):
-  Pipeline TableScan -> FilterProject -> OrderBy. TableScan just returned
-  its last batch and it has already been pushed through. Trace every
-  contract call the Driver makes, in order, until OrderBy hands out its
-  first sorted batch. Name the operator each call goes to.
-  Expected: TableScan getOutput -> nullptr, TableScan isFinished -> true,
-  FilterProject noMoreInput(); FilterProject getOutput -> nullptr,
-  isFinished -> true (noMoreInput_ && !input_), OrderBy noMoreInput()
-  (sorts); OrderBy getOutput -> first sorted batch. Note the loop walks
-  from the sink backward, so the exact interleaving is: visit OrderBy
-  first, then FilterProject, then TableScan; credit the causal chain.
+pending question (subskill 2, second attempt at the trace):
+  Pipeline TableScan -> FilterProject -> OrderBy, one Driver. TableScan
+  returned its last batch; it went through FilterProject into OrderBy;
+  the scan has no data left. Starting from the Driver's next visit to
+  OrderBy, write the full trace until OrderBy returns its first sorted
+  batch, as `Operator::method() -> return value` (void if none). Skip
+  isBlocked and stop/yield checks.
+  Expected (verified against Driver.cpp:612-836, FilterProject.cpp:196,
+  OrderBy.h:41-57, OrderBy.cpp:99-112):
+    pass 1 (walk from sink, i=2):
+      OrderBy::getOutput -> nullptr   (!noMoreInput_)
+      OrderBy::isFinished -> false
+      OrderBy::needsInput -> true
+      FilterProject::getOutput -> nullptr   (!input_)
+      FilterProject::isFinished -> false    (noMoreInput_ not set yet)
+      FilterProject::needsInput -> true
+      TableScan::getOutput -> nullptr
+      TableScan::isFinished -> true
+      FilterProject::noMoreInput -> void; `break` restarts walk at sink
+    pass 2:
+      OrderBy::getOutput -> nullptr; OrderBy::isFinished -> false
+      OrderBy::needsInput -> true
+      FilterProject::getOutput -> nullptr
+      FilterProject::isFinished -> true
+      OrderBy::noMoreInput -> void (sortBuffer_->noMoreInput sorts); break
+    pass 3:
+      OrderBy::getOutput -> first sorted batch. NO isFinished call
+      (only called on nullptr); Driver returns kBlock (serial mode,
+      sink returned a result).
+  Grade mainly on: (a) TableScan finish -> FilterProject::noMoreInput
+  included; (b) no isFinished after a non-null getOutput; (c) return
+  values right. Restart-after-break detail belongs to subskill 3;
+  note it but do not fail subskill 2 on it.
 
 diagnostic evidence:
   D1: named TableScan -> FilterProject; Driver calls getOutput on the
@@ -46,10 +68,23 @@ covered so far (subskill 2):
   - getOutput()==nullptr is ambiguous ("nothing now" vs. "done");
     isFinished() disambiguates. FilterProject::isFinished is
     noMoreInput_ && !input_. Correct (may have read the code).
-  - noMoreInput(): initially said the wrong direction ("downstream
-    finished -> call upstream noMoreInput"); corrected after a narrow
-    question (it goes to the operator that receives addInput, triggered
-    by the upstream finishing). Needs re-test -> pending question.
+  - noMoreInput(): initially said the wrong direction; corrected after
+    a narrow question.
+  - 2026-11-15 trace attempt 1 (answer given):
+      OrderBy::needsInput -> FilterProject::getOutput ->
+      FilterProject::isFinished -> OrderBy::noMoreInput ->
+      OrderBy::getOutput -> OrderBy::isFinished
+    Gaps: (1) omitted the TableScan step entirely, so FilterProject
+    could never be finished; (2) OrderBy::isFinished after a getOutput
+    that returned a batch (repeat of the noted misconception: isFinished
+    is only called on nullptr); (3) no return values; omitted the
+    initial sink visit. Downstream direction of the chain was right.
+    Told the user only about gap (1) and that "one other error" exists;
+    did NOT name gap (2).
+  - Narrow follow-up: "what sets FilterProject's noMoreInput_, triggered
+    by whom?" -> "FilterProject::noMoreInput(), called when
+    TableScan::isFinished() is true." Correct, but prompted -- does
+    not count as unprompted recall for the noMoreInput re-test.
   - Driver order: only calls isFinished() after getOutput() returned
     nullptr (Driver.cpp:762, :824). Hence !input_ is redundant for
     FilterProject today; kept so the promise "will never produce output
@@ -60,20 +95,31 @@ covered so far (subskill 2):
     harmless). Open thread: why that is safe -- revisit.
 
 misconceptions noted:
-  - Assumed the Driver checks isFinished() before getOutput() (wrong;
-    it is getOutput first, isFinished only on nullptr).
-  - noMoreInput direction confusion (fixed with help; re-testing).
+  - Assumed the Driver checks isFinished() after getOutput()
+    unconditionally / before it. Reality: getOutput first, isFinished
+    only on nullptr. RECURRED in 2026-11-15 trace attempt 1 -- still
+    live; make sure the pending answer tests it.
+  - noMoreInput direction confusion: fixed; correct under narrow
+    questioning on 2026-11-15, but dropped the step in a free trace.
+
 tutor notes:
   - Two tutor questions were flawed and withdrawn (the "simplified
     isFinished loses the last batch" scenario does not happen in the
     current Driver). Verify claims in source before posing scenarios.
-  - Driver::runInternal (velox/exec/Driver.cpp ~L613) walks operators
+  - Driver::runInternal (velox/exec/Driver.cpp ~L612) walks operators
     from the sink backward; per (op, nextOp): op->isBlocked,
     nextOp->isBlocked, nextOp->needsInput; if true op->getOutput ->
-    nextOp->addInput, i += 2; if null and op->isFinished(),
-    nextOp->noMoreInput(). needsInput false -> break (back-pressure).
-    Last operator: getOutput, then isFinished -> close, kAtEnd.
-next step: grade pending answer; if solid, test addInput/getOutput
-  interplay once more unprompted, consider 4/5 on subskill 2, then move
-  to subskill 3 (Driver loop).
+    nextOp->addInput, i += 2; if null, op->isBlocked again, then
+    op->isFinished(); if finished, nextOp->noMoreInput() and `break`
+    (restart from the sink); if not finished, fall through to i-1.
+    needsInput false -> break (back-pressure). Last operator:
+    getOutput; non-null -> return kBlock; null -> isFinished ->
+    close, kAtEnd, else continue.
+  - User tends to omit return values when not forced; always require
+    them in trace questions.
+next step: grade pending trace. If gaps (1) and (2) are both fixed
+  unprompted, do one more unprompted addInput/getOutput check, then
+  consider 4/5 on subskill 2 and move to subskill 3 (Driver loop,
+  starting with the break-and-restart after noMoreInput). If (2)
+  persists, address it with a narrow question about Driver.cpp:814.
 === END SAVE STATE ===
