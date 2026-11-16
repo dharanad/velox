@@ -1,17 +1,35 @@
 SOCRATIC-TUTOR SAVE STATE
 topic: Velox Vectors (repo: velox)
 target: 4/5 on every subskill, then a final mixed assessment
-sessions so far: 3
+sessions so far: 4
 
 skill map:
-1 Hierarchy & encodings     3/5  (was 2; wrapInConstant peeling learned)
-2 Buffers & memory          2/5  (was 1; first full pass done)
-3 Null representation       3/5  (one unprompted check banked: dict over
-                                  base nulls; failed wrapper-null direction)
-4 Wrapping & decoding       3/5  (review question asked, not answered)
-5 Complex vector layout     3/5  (one unprompted check banked: array offsets)
-6 SelectivityVector & lazy  3/5  (needed help on wrapper nulls; re-test)
-7 Ownership & mutability    3/5  (untouched this session)
+1 Hierarchy & encodings     3/5  (untouched in s4)
+2 Buffers & memory          4/5  (was 2; views, reallocate, string buffers,
+                                  and all s3 review items passed)
+3 Null representation       4/5  (was 3; wrapper-null direction passed
+                                  unprompted, incl. lazy loading)
+4 Wrapping & decoding       3/5  (one check banked: encoding-independent read
+                                  in a test stub; data<T>()[index(row)] only
+                                  assembled with step-by-step help - re-test)
+5 Complex vector layout     3/5  (untouched in s4; one unprompted check banked
+                                  in s3: array offsets)
+6 SelectivityVector & lazy  4/5  (was 3; no-compaction and unselected-row
+                                  questions passed unprompted)
+7 Ownership & mutability    3/5  (first question asked, not answered)
+
+how to run sessions (user preference, s4):
+- Code-WRITING questions go into velox/vector/tests/VectorTest.cpp as a
+scratch test stub with inputs, expected values and ONE TODO line; user fills
+it in, builds and runs it himself. Prose "write the expression" prompts were
+"too vague". Predict / explain / name-the-method questions stay in chat
+- When a stub's test passes the user deletes it on purpose. Do not restore
+it; follow-ups go in chat or in a NEW stub
+- Give only DecodedVector / rows to a helper function when the point is the
+DecodedVector API, otherwise he reads the indices buffer and base directly
+- Run: cd _build/debug && ninja velox_vector_test &&
+velox/vector/tests/velox_vector_test --gtest_filter="VectorTest.<name>"
+- Never commit stub code; only this file is committed (branch socratic-tutor)
 
 covered in session 1:
 - Flat vectors: one value slot per row, including null rows; values under
@@ -93,44 +111,100 @@ null chosen row -> null constant with no base. Got valueAt(3)=10 unaided;
 first said valueVector() points to dict; after help traced D2 over D1:
 3 -> 1 -> 0
 
+covered in session 4:
+- Decoding review (pending from s3), done as a test stub. Attempt 1 passed
+the test but bypassed DecodedVector (indices->as<vector_size_t>() and
+base->valueAt). Stub rewritten as helper taking only (decoded, rows), run
+over flat / dict / dict-over-dict / constant. Attempt 2 passed all four:
+decoded.base()->as<SimpleVector<int64_t>>()->valueAt(decoded.indices()[row])
+- decoded.indices() on flat: identity {0,1,2,3} (got it). <= 10'000 rows it
+points at a shared static array, 0 writes; above that fillInIndices allocates
+and fills size_ entries (velox/vector/DecodedVector.cpp:55, :313, :320);
+header says do not call it for flat/constant. Needed 3 attempts for the
+1,000,000-row count (10'000; "all the indices"; 100K) and the code walk for
+the 10,000-row boundary (said 10K twice before 0)
+- decoded.index(row): no allocation in any encoding (named it from the
+header). decoded.data<int64_t>() (first wrote data() without T). Then
+assembled decoded.data<int64_t>()[decoded.index(row)] - scaffolded
+- Wrapper null over non-null base (base [10,20,30], indices {2,0,1}, outer
+row 1 null): decoded.isNullAt(1) = true, unprompted. Same with lazy base:
+base rows {1,2} load, unprompted, in BASE row numbers; explained row 0 is
+skipped because the outer row is null (wasted I/O)
+- Selection: input [10..50], rows {1,3}: 80 is at result index 3; unselected
+result row 2 holds garbage / whatever allocation left. Both unprompted
+- 12-byte string -> 0 bytes in string buffers; > 12 -> prefix + pointer
+- BufferView (velox/buffer/Buffer.h:798): bytes owned elsewhere, releaser
+addRef/release, pool null, isView(). isMutable() false even when unique;
+reason: two views over one cached page, a write through one corrupts the
+other (got it)
+- FlatVector::mutableRawValues() on a view-backed vector copies to a new
+pool buffer (velox/vector/FlatVector.h:205): cached page still 42; copies
+800 B for 100 int64 rows to change one row
+- AlignedBuffer::reallocate (velox/buffer/Buffer.h:446): unique and within
+capacity -> in place (got it); shared -> new buffer for the caller, other
+holder keeps the old one. First said b->size() == 15 (same buffer), needed
+the code; then said 10 (elements) before 80 (bytes). After that b is mutable
+again (got it). Re-test (write 99 through a, read through b -> no) passed
+with the reason. Third path (unique, beyond capacity, pool->reallocate) NOT
+covered
+- String buffers: set() appends long strings to the last buffer;
+getBufferWithSpace reuses it only if unique() and size+n <= capacity, else
+allocates ~32 KB (velox/vector/FlatVector.cpp:53, :106).
+makeFlatVector({"ee","rr","rryy","12345678901234"}) -> buffer size 14 (got
+it). After b->acquireSharedStringBuffers(a), a->set of a 20 B string -> a has
+2 string buffers (got it, with reason)
+- Result pointing into input's string buffer without
+acquireSharedStringBuffers, input destroyed: long string pointer is invalid
+(use-after-free); inline "ee" is safe. Both unprompted
+- Reviews passed first try: refcount lives inside the allocation (intrusive);
+data at 0x2040 for allocation at 0x2000; freeing to pool B leaves
+A->usedBytes() at 1 KB
+
 misconceptions / weak spots:
 - (s1) Thought ConstantVector has per-row nulls (fixed)
-- (s1, s2) Thinks rows disappear / result shrinks under selection. Not
-re-tested in s3 - re-test
-- (s2, s3) Null layering: s2 ignored base nulls under a dictionary (fixed
-in s3, unprompted); s3 ignored WRAPPER nulls hiding the base row in lazy
-loading. Formula: isNullAt(row) = wrapperNull(row) ||
-base.isNullAt(index(row)). Re-test the wrapper direction unprompted
-- (s3) Mixes outer row numbers and base row numbers when asked for base rows
-- (s3) Stops index translation early (answered input index 3 for a
-two-layer peel)
-- (s3) Says "shared_ptr" for BufferPtr; called a copied StringView a member
-of the vector
-- (s3) Hex arithmetic slip (64 -> 0x64)
+- (s1, s2) Rows disappear / result shrinks under selection: FIXED in s4
+(two unprompted answers)
+- (s2, s3) Null layering, wrapper direction: FIXED in s4 unprompted. Formula:
+isNullAt(row) = wrapperNull(row) || base.isNullAt(index(row))
+- (s3) Mixing outer and base row numbers: correct in s4, keep an eye on it
+- (s3) Stops index translation early (two-layer peel): not re-tested in s4
+- (s2, s4) Reaches around DecodedVector: s2 used c0->values()[row]; s4 read
+the indices buffer + base directly, then decoded.indices() +
+base()->valueAt(). Knows the translation, does not reach for
+data<T>()[index(row)] on his own. Re-test unprompted in a stub
+- (s4) Forgets the template argument on decoded.data<T>()
+- (s4) Units and magnitudes: Buffer::size() answered in elements twice (it is
+bytes); 1,000,000 written as 100K. (s3 hex slip did not recur: 0x2040 right)
+- (s4) Does not follow a branch to its effect without help: knew
+wouldCopyIndices() was false and still said 10'000 entries are written
+- (s3) Said "shared_ptr" for BufferPtr: refcount location correct in s4
 - (s2) Gave "Infinity" for 100 / NULL
-- (s2) Wrote c0->values()/rawValues[row] on possibly-dictionary input while
-a DecodedVector was in scope
-- Habits (persisting in s3): misreads changed premises in follow-up
-questions; answers with a method name or mechanism instead of the value
-asked ("usedBytes() tells me", "the string buffer"); skips last part of
-multi-part questions; hedges ("should be tied"). Keep questions one-part and
-demand the concrete value
+- Habits (persisting in s4): answers with the mechanism instead of the value
+asked ("it will fill in all the indices"; described mutableRawValues instead
+of giving 42); answers a different question than the one asked. Reasoning is
+usually right once pinned down. Keep questions one-part, demand the concrete
+value, and walk code one branch at a time when he is stuck
 
 spaced review due (unprompted):
-- decoding (PENDING, asked at end of s3): write the read for a
-DecodedVector over BIGINT at a selected non-null row WITHOUT valueAt
-(answer: decoded.data<int64_t>()[decoded.index(row)])
-- nulls: wrapper null over a non-null base row - is it null? which base rows
-does loading touch?
-- selection: what is in the result at an unselected row, and result size
-- lazy: which call loads all rows vs selected rows
+- decoding: write the read at a selected non-null row from a DecodedVector
+with no hints (answer: decoded.data<int64_t>()[decoded.index(row)]); why
+indices() is wrong for flat/constant
+- lazy: which call loads all rows vs selected rows (not asked in s4)
 - ownership: a failing case for each level, supplied by the user
-- buffers: where does an AlignedBuffer's refcount live; why free to own pool
-- strings: when is keeping a StringView past its vector safe
+- buffers: Buffer::size() is bytes; reallocate when shared
+- index translation through two dictionary layers
+- nulls / selection / strings: passed in s4, review again in a later session
 
-next: answer the pending decoding review, then subskill 2 round 2 (buffer
-views / BufferView + isView, reallocate, StringView inlining edge at exactly
-12 B, getBufferWithSpace and string buffer sharing via addStringBuffer),
-then subskill 7 refresh (ensureWritable on a vector whose string buffer is
-shared), then subskill 1 round 2 (encoding list; SEQUENCE/BIASED status;
-what DecodedVector does with each)
+next: PENDING question (asked at end of s4, not answered): v = flat BIGINT
+100 rows, VectorPtr w = v, rows = {5} only,
+BaseVector::ensureWritable(rows, BIGINT(), pool(), v) - do v and w point at
+the same vector? (answer: no; use_count is 2 so v gets a new vector with the
+other 99 rows copied, w keeps the old one, velox/vector/BaseVector.cpp:779).
+Then subskill 7: the buffer-level failing case (vector unique, values buffer
+shared or a view -> FlatVector::ensureWritable copies values only,
+velox/vector/FlatVector-inl.h:506), and a flat StringView vector whose string
+buffer is shared (string buffers are kept, they are append-only). Then
+subskill 4 second check (unprompted decoded read in a stub, with a null
+row), subskill 5 (ensureNullRowsEmpty tested, map and row layout), subskill 1
+round 2 (encoding list; SEQUENCE/BIASED status; what DecodedVector does with
+each), then the final mixed assessment
