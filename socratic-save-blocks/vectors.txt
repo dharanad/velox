@@ -1,24 +1,28 @@
 SOCRATIC-TUTOR SAVE STATE
 topic: Velox Vectors (repo: velox)
 target: 4/5 on every subskill, then a final mixed assessment
-sessions so far: 5
+sessions so far: 6
 
 skill map:
-1 Hierarchy & encodings     3/5  (untouched in s4, s5)
+1 Hierarchy & encodings     3/5  (untouched in s4-s6; round 2 started at the
+                                  end of s6, first question unanswered)
 2 Buffers & memory          4/5  (was 2; views, reallocate, string buffers,
                                   and all s3 review items passed)
 3 Null representation       4/5  (was 3; wrapper-null direction passed
                                   unprompted, incl. lazy loading)
-4 Wrapping & decoding       4/5  (was 3; s5 stub passed unprompted with
-                                  decoded.valueAt<int64_t>(row) over flat /
-                                  dict+wrapper null / dict-over-dict /
-                                  constant)
-5 Complex vector layout     3/5  (untouched in s4, s5; one unprompted check
-                                  banked in s3: array offsets)
+4 Wrapping & decoding       4/5  (was 3; s5 stub passed unprompted; s6
+                                  two-layer index translation unprompted)
+5 Complex vector layout     3/5  (s6: row nulls and ensureNullRowsEmpty
+                                  passed; map layout FAILED 3x, re-test
+                                  passed after being told. Needs one
+                                  unprompted map check to reach 4)
 6 SelectivityVector & lazy  4/5  (was 3; no-compaction and unselected-row
                                   questions passed unprompted)
-7 Ownership & mutability    3/5  (s5: outcomes right, mechanism needed help;
-                                  needs one unprompted check to reach 4)
+7 Ownership & mutability    3/5  (s6: every outcome right unprompted,
+                                  incl. complement rows; mechanism wording
+                                  mixed vector/buffer level twice. Needs the
+                                  mechanism stated at the right level
+                                  unaided to reach 4)
 
 how to run sessions (user preference, s4):
 - Code-WRITING questions go into velox/vector/tests/VectorTest.cpp as a
@@ -194,14 +198,61 @@ string buffer; corrected himself to a raw pointer, no refcount
 rows): wrote decoded.valueAt<int64_t>(row) unprompted, template arg
 included; passed all four cases. Stub left uncommitted in the working tree
 
+covered in session 6:
+- Two-layer translation (pending from s5): base [10..50], inner {4,3,2,1,0},
+outer {0,0,3}: decoded.index(2) = 1 unprompted; defended vs "outer says 3"
+with the chain outer 3 -> inner 1 -> base 1. s3 "stops early": FIXED
+- Nulls buffer shared (test holds BufferPtr nulls = v->nulls(), v unique),
+static ensureWritable rows {2,3,4}: v.get() unchanged (unprompted). Asked
+for the deciding condition, quoted values_ = std::move(newValues), then
+nulls_ = std::move(newNulls) (buffer-level lines, not the decision); got
+result.use_count() == 1 only after being pointed at BaseVector.cpp:779-810
+- Said v->nulls().get() == nulls.get() after the call (wrong); "same
+location"; toy keep = a; a = std::move(b) -> said keep.get() == 0x2000.
+FAILED 3x; told: BufferPtr is a pointer value, a copy is an independent
+variable. Re-test: v->setNull(3) then isBitNull(old nulls, 3) -> false,
+defended (old buffer vs new buffer)
+- Buffer CoW nulls path: BaseVector::ensureWritable(rows)
+(BaseVector.cpp:763) memcpy's ALL nbytes(length_) null bits, not the
+complement (not asked yet)
+- Map: keys [1..5], values [10..50], offsets {3,0,1}, sizes {2,1,0}: row 0
+answered {1: 40, 50}, then {4: 40, 50} twice (one key with two values;
+admitted the literal had 1 key for size 2). Told: keys/values parallel,
+offset+size select the same range in both. Re-test keys {7,8,9,6} offsets
+{1,0} sizes {3,1} -> {8:80, 9:90, 6:60} passed
+- RowVector setNull(1): childAt(0)->isNullAt(1) false, unprompted
+- ensureNullRowsEmpty over elements [1..5], row 1 null: elements()->size()
+still 5; reason: compacting would shift other rows' offsets. Both right
+(ComplexVector.cpp was open in the IDE at the time)
+- Complement re-test (s5 weak spot): shared vector, rows {0,5} of 8 -> copies
+{1,2,3,4,6,7}, reason "selected rows are updated by the caller".
+UNPROMPTED, FIXED
+- Values buffer shared, v unique, rows {0,5}, set(0, 99): old values[0] is 0
+(unprompted). Reason given as "more than one reference on v", then
+v.use_count() == 2; narrowed to: the values buffer has refcount 2, v has 1
+- Verified for subskill 1 (not yet asked): VectorEncoding::Simple = BIASED,
+CONSTANT, DICTIONARY, FLAT, SEQUENCE, ROW, MAP, FLAT_MAP, ARRAY, LAZY,
+FUNCTION. DecodedVector: FLAT/ROW/ARRAY/MAP/FLAT_MAP/LAZY identity;
+CONSTANT constant mapping; DICTIONARY combineWrappers. BIASED is listed as
+identity (DecodedVector.cpp:84) but setBaseData hits VELOX_UNREACHABLE
+(:473); SEQUENCE goes to combineWrappers, which VELOX_FAILs "Unsupported
+wrapper encoding" (:208); FUNCTION hits the default VELOX_FAIL
+
 misconceptions / weak spots:
-- (s5) Thinks ensureWritable copies the rows passed in (it copies the
-COMPLEMENT; the rows passed in are the ones the caller is about to
-overwrite). Re-test unprompted
-- (s5) Conflates vector-level and buffer-level copy-on-write: thought a
-shared values buffer gives a new vector. Table given: vector shared ->
-static BaseVector::ensureWritable, new vector; buffer shared ->
-FlatVector::ensureWritable, same vector, new values buffer
+- (s6) Treats a copied BufferPtr as an alias of the original variable
+(reassigning one changes the other). Likely root of s5 "values holds a
+reference". Re-test unprompted with a new toy
+- (s6) Map entries: thought offset/size index keys and values separately (one
+key, several values). Re-test unprompted
+- (s6) Still mixes the levels when EXPLAINING ensureWritable ("reference on
+v", v.use_count() == 2 when only the buffer was shared); outcomes are right
+- (s5) Thinks ensureWritable copies the rows passed in: FIXED in s6
+(unprompted, with reason)
+- (s5) Conflates vector-level and buffer-level copy-on-write: outcomes FIXED
+in s6, explanation still mixed (see s6 above). Table given: vector shared ->
+static BaseVector::ensureWritable, new vector, copies complement; buffer
+shared -> FlatVector / BaseVector::ensureWritable(rows), same vector, new
+buffer
 - (s5) Stops reading at the static function, does not follow the virtual
 call (same pattern as s4 "does not follow a branch to its effect")
 - (s1) Thought ConstantVector has per-row nulls (fixed)
@@ -210,7 +261,7 @@ call (same pattern as s4 "does not follow a branch to its effect")
 - (s2, s3) Null layering, wrapper direction: FIXED in s4 unprompted. Formula:
 isNullAt(row) = wrapperNull(row) || base.isNullAt(index(row))
 - (s3) Mixing outer and base row numbers: correct in s4, keep an eye on it
-- (s3) Stops index translation early (two-layer peel): not re-tested in s4
+- (s3) Stops index translation early (two-layer peel): FIXED in s6
 - (s2, s4) Reaches around DecodedVector: s2 used c0->values()[row]; s4 read
 the indices buffer + base directly, then decoded.indices() +
 base()->valueAt(). Knows the translation, does not reach for
@@ -229,19 +280,23 @@ usually right once pinned down. Keep questions one-part, demand the concrete
 value, and walk code one branch at a time when he is stuck
 
 spaced review due (unprompted):
-- ownership (subskill 7, needed for 4/5): which rows ensureWritable copies
-(complement), and vector-shared vs buffer-shared outcome, in a NEW scenario
-(e.g. nulls buffer shared, or a view-backed values buffer); a failing case
-for each level, supplied by the user
+- ownership (subskill 7, needed for 4/5): ask the user to EXPLAIN, unaided,
+why a scenario gives a new vector vs a new buffer (e.g. view-backed values
+buffer, or vector shared AND buffer shared), naming which refcount is > 1
+and which function decides. Outcomes alone no longer count
+- BufferPtr copy semantics: new toy (e.g. BufferPtr x = v->values();
+v->values() replaced; what does x point at?)
+- maps (subskill 5, needed for 4/5): row literal from offsets/sizes over
+parallel keys/values, new numbers, unprompted
 - decoding: why indices() is wrong for flat/constant
-- lazy: which call loads all rows vs selected rows (not asked in s4, s5)
+- lazy: which call loads all rows vs selected rows (not asked in s4-s6)
 - buffers: Buffer::size() is bytes; reallocate when shared
 - nulls / selection / strings: passed in s4, review again in a later session
 
-next: PENDING question (asked at end of s5, not answered): two-layer index
-translation by hand. base [10,20,30,40,50], inner indices {4,3,2,1,0},
-outer indices {0,0,3}: decoded.index(2)? (answer: 1; outer 3 -> inner[3] =
-1 -> value 20; stopping after one layer gives 3). Then the subskill 7
-unprompted re-test above, subskill 5 (ensureNullRowsEmpty tested, map and
-row layout), subskill 1 round 2 (encoding list; SEQUENCE/BIASED status;
-what DecodedVector does with each), then the final mixed assessment
+next: PENDING question (asked at end of s6, not answered): "VectorEncoding::
+Simple has 11 values; without opening the file, name as many as you can."
+Then subskill 1 round 2: SEQUENCE/BIASED status, what DecodedVector does
+with each encoding (see s6 verified facts), hierarchy (BaseVector ->
+SimpleVector<T> -> Flat/Constant/Dictionary; complex vectors derive from
+BaseVector). Interleave the subskill 5 map and subskill 7 explanation
+re-tests above, then the final mixed assessment
