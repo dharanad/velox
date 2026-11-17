@@ -1,22 +1,24 @@
 SOCRATIC-TUTOR SAVE STATE
 topic: Velox Vectors (repo: velox)
 target: 4/5 on every subskill, then a final mixed assessment
-sessions so far: 4
+sessions so far: 5
 
 skill map:
-1 Hierarchy & encodings     3/5  (untouched in s4)
+1 Hierarchy & encodings     3/5  (untouched in s4, s5)
 2 Buffers & memory          4/5  (was 2; views, reallocate, string buffers,
                                   and all s3 review items passed)
 3 Null representation       4/5  (was 3; wrapper-null direction passed
                                   unprompted, incl. lazy loading)
-4 Wrapping & decoding       3/5  (one check banked: encoding-independent read
-                                  in a test stub; data<T>()[index(row)] only
-                                  assembled with step-by-step help - re-test)
-5 Complex vector layout     3/5  (untouched in s4; one unprompted check banked
-                                  in s3: array offsets)
+4 Wrapping & decoding       4/5  (was 3; s5 stub passed unprompted with
+                                  decoded.valueAt<int64_t>(row) over flat /
+                                  dict+wrapper null / dict-over-dict /
+                                  constant)
+5 Complex vector layout     3/5  (untouched in s4, s5; one unprompted check
+                                  banked in s3: array offsets)
 6 SelectivityVector & lazy  4/5  (was 3; no-compaction and unselected-row
                                   questions passed unprompted)
-7 Ownership & mutability    3/5  (first question asked, not answered)
+7 Ownership & mutability    3/5  (s5: outcomes right, mechanism needed help;
+                                  needs one unprompted check to reach 4)
 
 how to run sessions (user preference, s4):
 - Code-WRITING questions go into velox/vector/tests/VectorTest.cpp as a
@@ -160,7 +162,48 @@ acquireSharedStringBuffers, input destroyed: long string pointer is invalid
 data at 0x2040 for allocation at 0x2000; freeing to pool B leaves
 A->usedBytes() at 1 KB
 
+covered in session 5:
+- Static BaseVector::ensureWritable(rows, type, pool, v) with w = v:
+v.get() != w.get() (unprompted; reason loose, precise rule is
+use_count() == 1 at velox/vector/BaseVector.cpp:802). w keeps the old
+vector
+- Which rows the copy path copies: copyRows = rows.complement(size)
+(BaseVector.cpp:832). FAILED 3 times: "garbage" for an unselected row of an
+existing vector, then "all rows", then "copies row 5, others left out"
+(reversed). Did not know what the caller does to the rows passed in until
+narrowed via if/else (else-branch writes b into its rows). Told with the
+code; then got 7 for 10 rows / rows {2,3,4} only with an ASCII picture
+(not unprompted). Said "7" for valueAt(7) after the if/else hint
+- Unique vector, rows {2,3,4}: copies 0, in place (unprompted)
+- Unique vector but values buffer held by the test (BufferPtr values =
+v->values()): said "none" copied; got isMutable() == false when asked; then
+said BaseVector::ensureWritable has no buffer check (true - it is the
+virtual FlatVector::ensureWritable, velox/vector/FlatVector-inl.h:506, that
+checks values_->isMutable()). With the code: 7 values copied. Said v.get()
+changes ("we create a new one"); after an (a)/(b) choice: same vector,
+values_ swapped
+- VARCHAR, 40 B strings, values buffer shared, rows {2,3,4}: 112 bytes
+(7 x 16 B StringView), defended under pressure. Mixed in
+"acquireSharedStringBuffers on the new FlatVector" (that is the vector-copy
+case); stringBuffers_ untouched by FlatVector::ensureWritable (got it when
+asked yes/no, after first quoting the set() comment)
+- Old values buffer kept by test, then v.reset(): reading its long
+StringView is UB (unprompted). First said values "holds a reference" to the
+string buffer; corrected himself to a raw pointer, no refcount
+- Decoding stub (VectorTest.tutorDecodedSum, sum of selected non-null
+rows): wrote decoded.valueAt<int64_t>(row) unprompted, template arg
+included; passed all four cases. Stub left uncommitted in the working tree
+
 misconceptions / weak spots:
+- (s5) Thinks ensureWritable copies the rows passed in (it copies the
+COMPLEMENT; the rows passed in are the ones the caller is about to
+overwrite). Re-test unprompted
+- (s5) Conflates vector-level and buffer-level copy-on-write: thought a
+shared values buffer gives a new vector. Table given: vector shared ->
+static BaseVector::ensureWritable, new vector; buffer shared ->
+FlatVector::ensureWritable, same vector, new values buffer
+- (s5) Stops reading at the static function, does not follow the virtual
+call (same pattern as s4 "does not follow a branch to its effect")
 - (s1) Thought ConstantVector has per-row nulls (fixed)
 - (s1, s2) Rows disappear / result shrinks under selection: FIXED in s4
 (two unprompted answers)
@@ -186,25 +229,19 @@ usually right once pinned down. Keep questions one-part, demand the concrete
 value, and walk code one branch at a time when he is stuck
 
 spaced review due (unprompted):
-- decoding: write the read at a selected non-null row from a DecodedVector
-with no hints (answer: decoded.data<int64_t>()[decoded.index(row)]); why
-indices() is wrong for flat/constant
-- lazy: which call loads all rows vs selected rows (not asked in s4)
-- ownership: a failing case for each level, supplied by the user
+- ownership (subskill 7, needed for 4/5): which rows ensureWritable copies
+(complement), and vector-shared vs buffer-shared outcome, in a NEW scenario
+(e.g. nulls buffer shared, or a view-backed values buffer); a failing case
+for each level, supplied by the user
+- decoding: why indices() is wrong for flat/constant
+- lazy: which call loads all rows vs selected rows (not asked in s4, s5)
 - buffers: Buffer::size() is bytes; reallocate when shared
-- index translation through two dictionary layers
 - nulls / selection / strings: passed in s4, review again in a later session
 
-next: PENDING question (asked at end of s4, not answered): v = flat BIGINT
-100 rows, VectorPtr w = v, rows = {5} only,
-BaseVector::ensureWritable(rows, BIGINT(), pool(), v) - do v and w point at
-the same vector? (answer: no; use_count is 2 so v gets a new vector with the
-other 99 rows copied, w keeps the old one, velox/vector/BaseVector.cpp:779).
-Then subskill 7: the buffer-level failing case (vector unique, values buffer
-shared or a view -> FlatVector::ensureWritable copies values only,
-velox/vector/FlatVector-inl.h:506), and a flat StringView vector whose string
-buffer is shared (string buffers are kept, they are append-only). Then
-subskill 4 second check (unprompted decoded read in a stub, with a null
-row), subskill 5 (ensureNullRowsEmpty tested, map and row layout), subskill 1
-round 2 (encoding list; SEQUENCE/BIASED status; what DecodedVector does with
-each), then the final mixed assessment
+next: PENDING question (asked at end of s5, not answered): two-layer index
+translation by hand. base [10,20,30,40,50], inner indices {4,3,2,1,0},
+outer indices {0,0,3}: decoded.index(2)? (answer: 1; outer 3 -> inner[3] =
+1 -> value 20; stopping after one layer gives 3). Then the subskill 7
+unprompted re-test above, subskill 5 (ensureNullRowsEmpty tested, map and
+row layout), subskill 1 round 2 (encoding list; SEQUENCE/BIASED status;
+what DecodedVector does with each), then the final mixed assessment
